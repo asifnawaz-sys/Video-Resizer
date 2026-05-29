@@ -164,7 +164,27 @@ class P:
 
 # ---------- ffmpeg helpers ----------
 def _find_ffmpeg():
-    """Find ffmpeg - check all possible bundled locations, then PATH, then Homebrew"""
+    """Find ffmpeg - uses imageio-ffmpeg (bundled Python package) as primary source"""
+    ffmpeg = None
+    ffprobe = None
+    
+    # METHOD 1: imageio-ffmpeg (best - bundled as Python package, works in .app)
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg and Path(ffmpeg).exists():
+            log.info(f"ffmpeg found via imageio-ffmpeg: {ffmpeg}")
+            # ffprobe is usually next to ffmpeg
+            ffprobe_candidate = str(ffmpeg).replace('ffmpeg', 'ffprobe')
+            if Path(ffprobe_candidate).exists():
+                ffprobe = ffprobe_candidate
+            else:
+                ffprobe = ffmpeg  # use ffmpeg for probing too
+            return ffmpeg, ffprobe
+    except Exception as e:
+        log.debug(f"imageio-ffmpeg not available: {e}")
+    
+    # METHOD 2: PyInstaller bundle locations
     if getattr(sys, 'frozen', False):
         search_dirs = []
         if hasattr(sys, '_MEIPASS'):
@@ -172,12 +192,17 @@ def _find_ffmpeg():
         exe_dir = Path(sys.executable).parent
         search_dirs.append(exe_dir)
         search_dirs.append(exe_dir / '_internal')
-        search_dirs.append(exe_dir.parent / 'Frameworks')
         for search_dir in search_dirs:
             ffmpeg_p = search_dir / 'ffmpeg'
             if ffmpeg_p.exists():
                 os.environ['PATH'] = str(search_dir) + os.pathsep + os.environ.get('PATH', '')
-                break
+                ffmpeg = str(ffmpeg_p)
+                ffprobe_p = search_dir / 'ffprobe'
+                ffprobe = str(ffprobe_p) if ffprobe_p.exists() else ffmpeg
+                log.info(f"ffmpeg found in bundle: {ffmpeg}")
+                return ffmpeg, ffprobe
+    
+    # METHOD 3: PATH and Homebrew
     ffmpeg = shutil.which('ffmpeg')
     ffprobe = shutil.which('ffprobe')
     if not ffmpeg:
@@ -190,6 +215,7 @@ def _find_ffmpeg():
             if Path(p).exists():
                 ffprobe = p
                 break
+    
     return ffmpeg, ffprobe
 
 FFMPEG_PATH, FFPROBE_PATH = _find_ffmpeg()
@@ -1374,3 +1400,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
