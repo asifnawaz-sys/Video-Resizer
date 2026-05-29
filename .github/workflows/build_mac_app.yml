@@ -70,25 +70,39 @@ jobs:
             --clean \
             video_resizer_asif.py
 
-      - name: Bundle ffmpeg inside .app
+      - name: Bundle ffmpeg into ALL locations inside .app
         run: |
-          cp $(which ffmpeg)  dist/VideoResizer.app/Contents/MacOS/ffmpeg
-          cp $(which ffprobe) dist/VideoResizer.app/Contents/MacOS/ffprobe
+          FFMPEG_PATH=$(which ffmpeg)
+          FFPROBE_PATH=$(which ffprobe)
+          
+          # Location 1: Contents/MacOS/ (next to executable)
+          cp "$FFMPEG_PATH"  dist/VideoResizer.app/Contents/MacOS/ffmpeg
+          cp "$FFPROBE_PATH" dist/VideoResizer.app/Contents/MacOS/ffprobe
           chmod +x dist/VideoResizer.app/Contents/MacOS/ffmpeg
           chmod +x dist/VideoResizer.app/Contents/MacOS/ffprobe
-          echo "ffmpeg bundled"
+          
+          # Location 2: Contents/MacOS/_internal/ (PyInstaller _MEIPASS location)
+          mkdir -p dist/VideoResizer.app/Contents/MacOS/_internal
+          cp "$FFMPEG_PATH"  dist/VideoResizer.app/Contents/MacOS/_internal/ffmpeg
+          cp "$FFPROBE_PATH" dist/VideoResizer.app/Contents/MacOS/_internal/ffprobe
+          chmod +x dist/VideoResizer.app/Contents/MacOS/_internal/ffmpeg
+          chmod +x dist/VideoResizer.app/Contents/MacOS/_internal/ffprobe
+          
+          echo "✅ ffmpeg bundled in both locations"
           ls -lh dist/VideoResizer.app/Contents/MacOS/ffmpeg
+          ls -lh dist/VideoResizer.app/Contents/MacOS/_internal/ffmpeg
 
       - name: Zip the .app for download
         run: |
           cd dist
           zip -r ../VideoResizer_macOS_SiarDigital.zip VideoResizer.app
           cd ..
+          echo "✅ Final zip size:"
           du -sh VideoResizer_macOS_SiarDigital.zip
 
       - name: Upload .app as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoResizer-macOS
+          name: VideoResizer-macOS-FIXED
           path: VideoResizer_macOS_SiarDigital.zip
           retention-days: 30
