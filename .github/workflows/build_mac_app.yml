@@ -1,0 +1,71 @@
+name: Build VideoResizer macOS App
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-macos-app:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller moviepy opencv-python Pillow ttkbootstrap ultralytics
+
+      - name: Build macOS .app with PyInstaller
+        run: |
+          pyinstaller \
+            --windowed \
+            --onedir \
+            --name "VideoResizer" \
+            --osx-bundle-identifier "com.siardigital.videoresizer" \
+            --hidden-import cv2 \
+            --hidden-import PIL \
+            --hidden-import PIL.Image \
+            --hidden-import PIL.ImageTk \
+            --hidden-import ttkbootstrap \
+            --hidden-import ultralytics \
+            --hidden-import moviepy \
+            --hidden-import moviepy.editor \
+            --hidden-import tkinter \
+            --hidden-import tkinter.ttk \
+            --hidden-import tkinter.filedialog \
+            --hidden-import tkinter.messagebox \
+            --collect-data ultralytics \
+            --collect-data ttkbootstrap \
+            --noconfirm \
+            --clean \
+            video_resizer_asif.py
+
+      - name: Bundle ffmpeg inside .app
+        run: |
+          cp $(which ffmpeg)  dist/VideoResizer.app/Contents/MacOS/ffmpeg
+          cp $(which ffprobe) dist/VideoResizer.app/Contents/MacOS/ffprobe
+          chmod +x dist/VideoResizer.app/Contents/MacOS/ffmpeg
+          chmod +x dist/VideoResizer.app/Contents/MacOS/ffprobe
+
+      - name: Zip the .app for download
+        run: |
+          cd dist
+          zip -r ../VideoResizer_macOS_SiarDigital.zip VideoResizer.app
+
+      - name: Upload .app as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoResizer-macOS
+          path: VideoResizer_macOS_SiarDigital.zip
+          retention-days: 30
