@@ -24,7 +24,13 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install pyinstaller moviepy opencv-python Pillow ttkbootstrap ultralytics
+          pip install pyinstaller
+          pip install moviepy
+          pip install opencv-python
+          pip install Pillow
+          pip install ttkbootstrap
+          pip install ultralytics
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
       - name: Build macOS .app with PyInstaller
         run: |
@@ -37,16 +43,29 @@ jobs:
             --hidden-import PIL \
             --hidden-import PIL.Image \
             --hidden-import PIL.ImageTk \
+            --hidden-import PIL.ImageFilter \
             --hidden-import ttkbootstrap \
+            --hidden-import ttkbootstrap.themes \
+            --hidden-import ttkbootstrap.style \
             --hidden-import ultralytics \
+            --hidden-import ultralytics.models \
+            --hidden-import ultralytics.models.yolo \
+            --hidden-import ultralytics.nn \
+            --hidden-import ultralytics.utils \
             --hidden-import moviepy \
             --hidden-import moviepy.editor \
+            --hidden-import moviepy.video \
+            --hidden-import moviepy.audio \
             --hidden-import tkinter \
             --hidden-import tkinter.ttk \
             --hidden-import tkinter.filedialog \
             --hidden-import tkinter.messagebox \
-            --collect-data ultralytics \
-            --collect-data ttkbootstrap \
+            --hidden-import torch \
+            --hidden-import torchvision \
+            --collect-all ultralytics \
+            --collect-all ttkbootstrap \
+            --collect-all moviepy \
+            --collect-all cv2 \
             --noconfirm \
             --clean \
             video_resizer_asif.py
@@ -57,11 +76,15 @@ jobs:
           cp $(which ffprobe) dist/VideoResizer.app/Contents/MacOS/ffprobe
           chmod +x dist/VideoResizer.app/Contents/MacOS/ffmpeg
           chmod +x dist/VideoResizer.app/Contents/MacOS/ffprobe
+          echo "ffmpeg bundled"
+          ls -lh dist/VideoResizer.app/Contents/MacOS/ffmpeg
 
       - name: Zip the .app for download
         run: |
           cd dist
           zip -r ../VideoResizer_macOS_SiarDigital.zip VideoResizer.app
+          cd ..
+          du -sh VideoResizer_macOS_SiarDigital.zip
 
       - name: Upload .app as artifact
         uses: actions/upload-artifact@v4
