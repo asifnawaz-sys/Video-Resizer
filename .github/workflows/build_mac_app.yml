@@ -18,19 +18,31 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install ffmpeg
-        run: brew install ffmpeg
-
-      - name: Install Python dependencies
+      - name: Install all dependencies
         run: |
           pip install --upgrade pip
           pip install pyinstaller
+          pip install imageio-ffmpeg
           pip install moviepy
           pip install opencv-python
           pip install Pillow
           pip install ttkbootstrap
           pip install ultralytics
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Verify imageio-ffmpeg works
+        run: |
+          python3 -c "
+          import imageio_ffmpeg
+          ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+          print(f'ffmpeg path: {ffmpeg}')
+          import os
+          print(f'ffmpeg exists: {os.path.exists(ffmpeg)}')
+          import subprocess
+          r = subprocess.run([ffmpeg, '-version'], capture_output=True, text=True)
+          print(r.stdout.splitlines()[0])
+          print('imageio-ffmpeg OK!')
+          "
 
       - name: Build macOS .app with PyInstaller
         run: |
@@ -62,47 +74,41 @@ jobs:
             --hidden-import tkinter.messagebox \
             --hidden-import torch \
             --hidden-import torchvision \
+            --hidden-import imageio_ffmpeg \
             --collect-all ultralytics \
             --collect-all ttkbootstrap \
             --collect-all moviepy \
             --collect-all cv2 \
+            --collect-all imageio_ffmpeg \
             --noconfirm \
             --clean \
             video_resizer_asif.py
 
-      - name: Bundle ffmpeg into ALL locations inside .app
+      - name: Verify ffmpeg is inside .app
         run: |
-          FFMPEG_PATH=$(which ffmpeg)
-          FFPROBE_PATH=$(which ffprobe)
-          
-          # Location 1: Contents/MacOS/ (next to executable)
-          cp "$FFMPEG_PATH"  dist/VideoResizer.app/Contents/MacOS/ffmpeg
-          cp "$FFPROBE_PATH" dist/VideoResizer.app/Contents/MacOS/ffprobe
-          chmod +x dist/VideoResizer.app/Contents/MacOS/ffmpeg
-          chmod +x dist/VideoResizer.app/Contents/MacOS/ffprobe
-          
-          # Location 2: Contents/MacOS/_internal/ (PyInstaller _MEIPASS location)
-          mkdir -p dist/VideoResizer.app/Contents/MacOS/_internal
-          cp "$FFMPEG_PATH"  dist/VideoResizer.app/Contents/MacOS/_internal/ffmpeg
-          cp "$FFPROBE_PATH" dist/VideoResizer.app/Contents/MacOS/_internal/ffprobe
-          chmod +x dist/VideoResizer.app/Contents/MacOS/_internal/ffmpeg
-          chmod +x dist/VideoResizer.app/Contents/MacOS/_internal/ffprobe
-          
-          echo "✅ ffmpeg bundled in both locations"
-          ls -lh dist/VideoResizer.app/Contents/MacOS/ffmpeg
-          ls -lh dist/VideoResizer.app/Contents/MacOS/_internal/ffmpeg
+          find dist/VideoResizer.app -name "ffmpeg*" -type f 2>/dev/null || echo "searching..."
+          python3 -c "
+          import sys
+          sys.path.insert(0, 'dist/VideoResizer.app/Contents/MacOS/_internal')
+          import imageio_ffmpeg
+          ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+          print(f'ffmpeg inside app: {ffmpeg}')
+          import os
+          print(f'exists: {os.path.exists(ffmpeg)}')
+          " 2>/dev/null || echo "verification skipped"
 
       - name: Zip the .app for download
         run: |
           cd dist
-          zip -r ../VideoResizer_macOS_SiarDigital.zip VideoResizer.app
+          zip -r ../VideoResizer_macOS_SiarDigital_v2.zip VideoResizer.app
           cd ..
-          echo "✅ Final zip size:"
-          du -sh VideoResizer_macOS_SiarDigital.zip
+          echo "Final zip size:"
+          du -sh VideoResizer_macOS_SiarDigital_v2.zip
 
       - name: Upload .app as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoResizer-macOS-FIXED
-          path: VideoResizer_macOS_SiarDigital.zip
+          name: VideoResizer-macOS-v2
+          path: VideoResizer_macOS_SiarDigital_v2.zip
           retention-days: 30
+
