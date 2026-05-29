@@ -164,16 +164,33 @@ class P:
 
 # ---------- ffmpeg helpers ----------
 def _find_ffmpeg():
-    """Find ffmpeg - check bundled location first, then PATH"""
-    # When bundled with PyInstaller
+    """Find ffmpeg - check all possible bundled locations, then PATH, then Homebrew"""
     if getattr(sys, 'frozen', False):
-        bundle_dir = Path(sys._MEIPASS)
-        for name in ['ffmpeg', 'ffprobe']:
-            p = bundle_dir / name
-            if p.exists():
-                os.environ['PATH'] = str(bundle_dir) + os.pathsep + os.environ.get('PATH', '')
+        search_dirs = []
+        if hasattr(sys, '_MEIPASS'):
+            search_dirs.append(Path(sys._MEIPASS))
+        exe_dir = Path(sys.executable).parent
+        search_dirs.append(exe_dir)
+        search_dirs.append(exe_dir / '_internal')
+        search_dirs.append(exe_dir.parent / 'Frameworks')
+        for search_dir in search_dirs:
+            ffmpeg_p = search_dir / 'ffmpeg'
+            if ffmpeg_p.exists():
+                os.environ['PATH'] = str(search_dir) + os.pathsep + os.environ.get('PATH', '')
                 break
-    return shutil.which('ffmpeg'), shutil.which('ffprobe')
+    ffmpeg = shutil.which('ffmpeg')
+    ffprobe = shutil.which('ffprobe')
+    if not ffmpeg:
+        for p in ['/usr/local/bin/ffmpeg', '/opt/homebrew/bin/ffmpeg', '/usr/bin/ffmpeg']:
+            if Path(p).exists():
+                ffmpeg = p
+                break
+    if not ffprobe:
+        for p in ['/usr/local/bin/ffprobe', '/opt/homebrew/bin/ffprobe', '/usr/bin/ffprobe']:
+            if Path(p).exists():
+                ffprobe = p
+                break
+    return ffmpeg, ffprobe
 
 FFMPEG_PATH, FFPROBE_PATH = _find_ffmpeg()
 
