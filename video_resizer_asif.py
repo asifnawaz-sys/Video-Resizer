@@ -157,9 +157,16 @@ class P:
     PU = "#9d6cff"; PU2= "#6d28d9"; OR = "#ff9f00"; RD = "#ff4050"
     RD2= "#cc2233"; PK = "#f472b6"; YL = "#facc15"; CY = "#22d3ee"
     TXT  = "#ccddef"; TXT2 = "#5a7a9a"; TXT3 = "#2d4460"
-    MONO   = ("Consolas", 9); MONO_S = ("Consolas", 7); MONO_B = ("Consolas", 9, "bold")
-    MONO_L = ("Consolas", 12, "bold"); MONO_H = ("Consolas", 16, "bold")
+    # Cross-platform monospace font (Menlo=macOS, Consolas=Win, DejaVu=Linux)
+    import platform as _platform
+    _OS = _platform.system()
+    _MONO_FACE = "Menlo" if _OS == "Darwin" else ("Consolas" if _OS == "Windows" else "DejaVu Sans Mono")
+    MONO   = (_MONO_FACE, 9); MONO_S = (_MONO_FACE, 7); MONO_B = (_MONO_FACE, 9, "bold")
+    MONO_L = (_MONO_FACE, 12, "bold"); MONO_H = (_MONO_FACE, 16, "bold")
     DET_COLORS = [G1,B1,PU,OR,RD,PK,YL,"#34d399","#60a5fa","#c084fc","#fb923c"]
+# Global font name for use outside class P
+import platform as _plt
+_MONO_FACE = "Menlo" if _plt.system() == "Darwin" else ("Consolas" if _plt.system() == "Windows" else "DejaVu Sans Mono")
 
 # ============================================================
 # macOS / bundled-app ffmpeg detection
@@ -195,10 +202,11 @@ def _find_ffmpeg_exe():
     return None
 
 
-def _find_ffprobe_exe():
+def _find_ffprobe_exe(ffmpeg_path=None):
     """
     Returns path to ffprobe.  imageio_ffmpeg bundles ffmpeg only,
     so for ffprobe we fall back to PATH (or derive path from ffmpeg).
+    ffmpeg_path is passed explicitly to avoid circular reference.
     """
     # Try system PATH first
     for candidate in ["ffprobe", "ffprobe.exe"]:
@@ -211,7 +219,6 @@ def _find_ffprobe_exe():
             pass
 
     # If ffmpeg is a full path, try sibling ffprobe
-    ffmpeg_path = FFMPEG_EXE
     if ffmpeg_path and ffmpeg_path not in ("ffmpeg", "ffmpeg.exe"):
         sibling = Path(ffmpeg_path).parent / "ffprobe"
         if sibling.exists():
@@ -220,10 +227,10 @@ def _find_ffprobe_exe():
         if sibling_exe.exists():
             return str(sibling_exe)
 
-    return "ffprobe"  # last resort, may fail
+    return "ffprobe"  # last resort
 
 
-# Resolve once at startup
+# Resolve once at startup — order matters: ffmpeg first, then ffprobe
 FFMPEG_EXE  = _find_ffmpeg_exe()
 HAS_FFMPEG  = FFMPEG_EXE is not None
 FFMPEG_VERSION = ""
@@ -236,7 +243,7 @@ if HAS_FFMPEG:
     except Exception as exc:
         log.warning("ffmpeg version check failed: %s", exc)
 
-FFPROBE_EXE = _find_ffprobe_exe()
+FFPROBE_EXE = _find_ffprobe_exe(ffmpeg_path=FFMPEG_EXE)
 
 # ---------- ffmpeg encoder availability ----------
 _ffmpeg_encoders_cache = None
@@ -534,15 +541,23 @@ def _build_ffmpeg_cmd(in_path, out_path, vf, is_complex,
     cmd += ["-c:v", vcodec]
     if fmt == "WEBM":
         cmd += ["-crf", crf, "-b:v", "0", "-deadline", "good", "-cpu-used", "2"]
+        # WEBM (libvpx-vp9) does NOT support -preset — skip extra_v_flags that contain it
+        safe_extra = [f for f in (extra_v_flags or []) if f != "-preset"
+                      and not f in ("ultrafast","superfast","veryfast","faster",
+                                    "fast","medium","slow","slower","veryslow")]
+        if safe_extra:
+            cmd += safe_extra
     else:
         cmd += ["-crf", crf, "-preset", speed,
                 "-profile:v", "high", "-level:v", "4.2"]
-    if extra_v_flags:
-        cmd += extra_v_flags
+        if extra_v_flags:
+            cmd += extra_v_flags
     cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart"]
 
-    # ---- AUDIO: this is where the old code was broken ----
+    # ---- AUDIO ----
     if include_audio:
+        # For AAC streams being re-encoded to AAC, we re-encode (safe, transparent at 192k+)
+        # acodec is always aac/libopus here — straightforward encode
         cmd += ["-c:a", acodec, "-b:a", audio_br, "-ar", "44100", "-ac", "2"]
     else:
         cmd += ["-an"]
@@ -568,6 +583,9 @@ def encode_file(in_path, out_path, cfg, vf, vi, log_cb):
     # Should we include audio at all?
     want_audio  = (audio_br != "No Audio") and has_audio
     audio_kbps  = int(audio_br.replace("k", "")) if want_audio else 0
+
+    # For MOV output: use libopus-compatible or aac — already handled by CODEC_MAP
+    # Audio quality note: at 192k AAC, re-encode is transparent (inaudible difference)
 
     is_complex = any(x in vf for x in
                      ("split", "overlay", "hstack", "vstack"))
@@ -917,7 +935,7 @@ class NeonBtn(tk.Button):
                  color=P.G1, danger=False, **kw):
         c = P.RD if danger else color
         super().__init__(parent, text=text, command=command,
-                         font=("Consolas",8,"bold"), fg=c, bg=P.BG4,
+                         font=(_MONO_FACE,8,"bold"), fg=c, bg=P.BG4,
                          activebackground=P.BDR2, activeforeground="#fff",
                          relief="flat", cursor="hand2", padx=10, pady=5,
                          highlightthickness=1, highlightbackground=c, **kw)
@@ -947,13 +965,13 @@ class DetectionPanel(tk.Frame):
 
         tk.Label(self,
                  text="  YOLOv8n  |  COCO 80 classes  |  Pre-trained",
-                 font=("Consolas",7), fg=P.TXT3, bg=P.BG3).pack(
+                 font=(_MONO_FACE,7), fg=P.TXT3, bg=P.BG3).pack(
                      fill="x", padx=8, pady=(0,3))
 
         ch = tk.Frame(self, bg=P.BG2)
         ch.pack(fill="x", padx=10)
         for t, w in [("#",2),("CLASS",14),("CONF",6),("SCORE",0)]:
-            tk.Label(ch, text=t, font=("Consolas",7,"bold"),
+            tk.Label(ch, text=t, font=(_MONO_FACE,7,"bold"),
                      fg=P.TXT3, bg=P.BG2, width=w, anchor="w").pack(
                          side="left", padx=(0,3))
 
@@ -968,10 +986,10 @@ class DetectionPanel(tk.Frame):
             tk.Label(row, text=f"{i+1}", font=P.MONO_S,
                      fg=P.TXT3, bg=P.BG3, width=2).pack(side="left")
             tk.Label(row, text=" ", bg=col, width=2).pack(side="left", padx=(2,0))
-            nm = tk.Label(row, text="", font=("Consolas",8),
+            nm = tk.Label(row, text="", font=(_MONO_FACE,8),
                           fg=P.TXT, bg=P.BG3, width=14, anchor="w")
             nm.pack(side="left", padx=(4,0))
-            cf = tk.Label(row, text="", font=("Consolas",8,"bold"),
+            cf = tk.Label(row, text="", font=(_MONO_FACE,8,"bold"),
                           fg=col, bg=P.BG3, width=6)
             cf.pack(side="left")
             bar = BarMeter(row, color=col, height=5)
@@ -1064,10 +1082,10 @@ class VideoResizerApp:
         self.category_var  = tk.StringVar(value="General")
         self.placement_var = tk.StringVar(value="smart_crop")
         self.format_var    = tk.StringVar(value="MP4")
-        self.quality_var   = tk.StringVar(value="Balanced (CRF 26)")
+        self.quality_var   = tk.StringVar(value="High     (CRF 22)")
         self.speed_var     = tk.StringVar(value="slow")
         self.fps_var       = tk.StringVar(value="Source FPS")
-        self.audio_var     = tk.StringVar(value="192k")
+        self.audio_var     = tk.StringVar(value="256k")
         self.output_dir    = tk.StringVar(
             value=str(Path.home() / "Desktop" / "output_videos"))
         self.autozip_var   = tk.BooleanVar(value=True)
@@ -1118,7 +1136,7 @@ class VideoResizerApp:
         self.logo_lbl.pack(side="left", pady=8)
         tk.Label(left,
                  text="  by Asif Nawaz  |  SIAR DIGITAL  ",
-                 font=("Consolas",8,"bold"), fg=P.YL, bg=P.BG0
+                 font=(_MONO_FACE,8,"bold"), fg=P.YL, bg=P.BG0
                  ).pack(side="left", padx=10)
         tags = [
             ("YOLOv8",P.PU,HAS_YOLO), ("COCO 80-class",P.B1,HAS_YOLO),
@@ -1132,7 +1150,7 @@ class VideoResizerApp:
                          highlightbackground=c if ok else P.BDR)
             f.pack(side="left", padx=2, pady=15)
             tk.Label(f, text=f"  {tag}  ",
-                     font=("Consolas",7,"bold"), fg=c, bg=P.BG3).pack()
+                     font=(_MONO_FACE,7,"bold"), fg=c, bg=P.BG3).pack()
         pills = tk.Frame(bar, bg=P.BG0)
         pills.pack(side="right", padx=10)
         for name, ok in [
@@ -1146,7 +1164,7 @@ class VideoResizerApp:
             f.pack(side="left", padx=2, pady=14)
             tk.Label(f,
                      text=f"  {'OK' if ok else 'NO'}  {name}  ",
-                     font=("Consolas",7,"bold"), fg=col, bg=bg2).pack()
+                     font=(_MONO_FACE,7,"bold"), fg=col, bg=bg2).pack()
 
     def _build_scrollable_left(self, parent):
         canvas = tk.Canvas(parent, bg=P.BG1, highlightthickness=0)
@@ -1163,10 +1181,23 @@ class VideoResizerApp:
 
         def _scroll(event):
             try:
-                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+                # macOS trackpad uses event.delta directly (already scaled)
+                # Windows uses event.delta / 120
+                import platform
+                if platform.system() == "Darwin":
+                    canvas.yview_scroll(int(-1 * event.delta), "units")
+                else:
+                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except:
+                pass
+        def _scroll_linux(event, direction):
+            try:
+                canvas.yview_scroll(direction, "units")
             except:
                 pass
         canvas.bind_all("<MouseWheel>", _scroll)
+        canvas.bind_all("<Button-4>", lambda e: _scroll_linux(e, -1))
+        canvas.bind_all("<Button-5>", lambda e: _scroll_linux(e, 1))
 
         col_a = tk.Frame(self.sf, bg=P.BG1)
         col_a.pack(side="left", fill="both", expand=True, padx=(6,3), pady=4)
@@ -1211,14 +1242,14 @@ class VideoResizerApp:
         sb2 = tk.Scrollbar(lbf, bg=P.BG3)
         sb2.pack(side="right", fill="y")
         self.file_lb = tk.Listbox(lbf, bg=P.BG0, fg=P.TXT,
-                                  font=("Consolas",7), height=7,
+                                  font=(_MONO_FACE,7), height=7,
                                   selectbackground=P.PU2, borderwidth=0,
                                   highlightthickness=0,
                                   yscrollcommand=sb2.set)
         self.file_lb.pack(side="left", fill="x", expand=True)
         sb2.config(command=self.file_lb.yview)
         self.struct_lbl = tk.Label(body, text="",
-                                   font=("Consolas",7), fg=P.OR, bg=P.BG3)
+                                   font=(_MONO_FACE,7), fg=P.OR, bg=P.BG3)
         self.struct_lbl.pack(anchor="w", padx=12, pady=(0,8))
 
     def _build_size_panel(self, p):
@@ -1239,7 +1270,7 @@ class VideoResizerApp:
             tk.Label(cf, text=lbl, font=P.MONO_S,
                      fg=P.TXT3, bg=P.BG3).pack(anchor="w")
             tk.Entry(cf, textvariable=var,
-                     font=("Consolas",18,"bold"), fg=col, bg=P.BG0,
+                     font=(_MONO_FACE,18,"bold"), fg=col, bg=P.BG0,
                      insertbackground=col, relief="flat",
                      highlightthickness=1, highlightbackground=P.BDR,
                      highlightcolor=col).pack(fill="x", ipady=8)
@@ -1255,7 +1286,7 @@ class VideoResizerApp:
             rb = tk.Radiobutton(
                 f, text=name, variable=self.category_var, value=name,
                 bg=P.BG4, fg=color, selectcolor=P.BG4, activebackground=P.BG4,
-                font=("Consolas",8,"bold"),
+                font=(_MONO_FACE,8,"bold"),
                 command=lambda c=color, fr=f, n=name: self._sel_cat(n, c))
             rb.pack(pady=8, padx=4)
             self._cat_frames[name] = (f, color)
@@ -1285,7 +1316,7 @@ class VideoResizerApp:
             tk.Radiobutton(fr, text=fmt, variable=self.format_var, value=fmt,
                            bg=P.BG3, fg=P.OR, selectcolor=P.BG3,
                            activebackground=P.BG3,
-                           font=("Consolas",9,"bold")).pack(side="left", padx=8)
+                           font=(_MONO_FACE,9,"bold")).pack(side="left", padx=8)
         qr = tk.Frame(body, bg=P.BG3)
         qr.pack(fill="x", padx=10, pady=(0,4))
         tk.Label(qr, text="QUALITY:", font=P.MONO_S,
@@ -1295,7 +1326,7 @@ class VideoResizerApp:
                      state="readonly", font=P.MONO, width=22).pack(side="left")
         tk.Label(body,
                  text="  CRF = Constant Rate Factor  |  lower = better quality  |  18 = near-lossless",
-                 font=("Consolas",7), fg=P.TXT3, bg=P.BG3
+                 font=(_MONO_FACE,7), fg=P.TXT3, bg=P.BG3
                  ).pack(anchor="w", padx=10, pady=(0,2))
         af = tk.Frame(body, bg=P.BG3)
         af.pack(fill="x", padx=10, pady=(0,10))
@@ -1332,7 +1363,7 @@ class VideoResizerApp:
         tk.Label(body,
                  text="  Smart Crop: scale-to-fill then center-crop"
                       "  (CSS cover / Photoshop fit)",
-                 font=("Consolas",7), fg=P.G1, bg=P.BG3
+                 font=(_MONO_FACE,7), fg=P.G1, bg=P.BG3
                  ).pack(anchor="w", padx=10, pady=(6,2))
         for label, key, is_ai in PLACEMENT_MODES:
             f = tk.Frame(body, bg=P.BG3, cursor="hand2",
@@ -1353,7 +1384,7 @@ class VideoResizerApp:
                 ai_col = P.PU if is_ok else P.RD
                 ai_txt = " [YOLOv8]" if key == "yolo_crop" else " [AI]"
                 tk.Label(inner, text=ai_txt,
-                         font=("Consolas",7,"bold"),
+                         font=(_MONO_FACE,7,"bold"),
                          fg=ai_col, bg=P.BG3).pack(side="left")
             self._placement_frames[key] = f
             for widget in ([f, inner] + list(inner.winfo_children())):
@@ -1395,7 +1426,7 @@ class VideoResizerApp:
         row.pack(fill="x", padx=10, pady=(10,4))
         tk.Checkbutton(row, text="Enable size limit",
                        variable=self.shopify_var,
-                       font=("Consolas",9,"bold"), fg=P.OR, bg=P.BG3,
+                       font=(_MONO_FACE,9,"bold"), fg=P.OR, bg=P.BG3,
                        selectcolor=P.BG3, activebackground=P.BG3,
                        activeforeground=P.OR).pack(side="left")
         tk.Label(row, text="  Max:", font=P.MONO_S,
@@ -1409,7 +1440,7 @@ class VideoResizerApp:
         tk.Label(body,
                  text="  CRF primary  →  true 2-pass if over limit"
                       "  →  faststart  →  yuv420p",
-                 font=("Consolas",7), fg=P.TXT3, bg=P.BG3
+                 font=(_MONO_FACE,7), fg=P.TXT3, bg=P.BG3
                  ).pack(anchor="w", padx=10, pady=(0,10))
 
     def _build_output_panel(self, p):
@@ -1439,7 +1470,7 @@ class VideoResizerApp:
         self.preview_cv.pack(fill="x", padx=8, pady=(0,2))
         self._preview_placeholder()
         self.preview_name = tk.Label(p, text="",
-                                     font=("Consolas",7),
+                                     font=(_MONO_FACE,7),
                                      fg=P.TXT3, bg=P.BG0)
         self.preview_name.pack(anchor="w", padx=10, pady=(0,4))
         tk.Frame(p, bg=P.BDR, height=1).pack(fill="x", padx=8, pady=(2,4))
@@ -1463,7 +1494,7 @@ class VideoResizerApp:
             tk.Label(f, text=lbl, font=P.MONO_S,
                      fg=col, bg=P.BG3).pack(pady=(5,0))
             sl = tk.Label(f, text="0",
-                          font=("Consolas",22,"bold"), fg=col, bg=P.BG3)
+                          font=(_MONO_FACE,22,"bold"), fg=col, bg=P.BG3)
             sl.pack(pady=(0,5))
             self.stat_lbl[key] = sl
 
@@ -1485,10 +1516,10 @@ class VideoResizerApp:
                  font=P.MONO_B, fg=P.G1, bg=P.BG0).pack(side="left")
         NeonBtn(lhdr, "Clear", self._clear_log, P.TXT2).pack(side="right")
         tk.Label(lhdr, text=str(LOG_FILE.name),
-                 font=("Consolas",6), fg=P.TXT3,
+                 font=(_MONO_FACE,6), fg=P.TXT3,
                  bg=P.BG0).pack(side="right", padx=8)
         self.log_box = tk.Text(
-            p, bg=P.BG0, fg=P.TXT, font=("Consolas",7),
+            p, bg=P.BG0, fg=P.TXT, font=(_MONO_FACE,7),
             height=12, relief="flat", wrap="word",
             state="disabled", borderwidth=0, selectbackground=P.PU2)
         self.log_box.pack(fill="both", expand=True, padx=8, pady=(0,4))
@@ -1518,7 +1549,7 @@ class VideoResizerApp:
             suffix = "  READY" if ok else f"  -> {hint}"
             tk.Label(f,
                      text=f"  {'OK' if ok else '!!'} {name}{suffix}",
-                     font=("Consolas",7), fg=col if ok else P.RD,
+                     font=(_MONO_FACE,7), fg=col if ok else P.RD,
                      bg=bg2, anchor="w").pack(fill="x", pady=2)
 
     def _build_bottombar(self):
@@ -1527,14 +1558,14 @@ class VideoResizerApp:
         bar.pack_propagate(False)
         self.start_btn = tk.Button(
             bar, text="   START PROCESSING   ",
-            font=("Consolas",15,"bold"),
+            font=(_MONO_FACE,15,"bold"),
             fg=P.BG0, bg=P.G1, activebackground=P.G2,
             activeforeground=P.BG0, relief="flat",
             cursor="hand2", command=self._start)
         self.start_btn.pack(side="left", fill="both",
                             expand=True, padx=(10,4), pady=8)
         tk.Button(bar, text="  STOP  ",
-                  font=("Consolas",14,"bold"),
+                  font=(_MONO_FACE,14,"bold"),
                   fg="#fff", bg=P.RD, activebackground=P.RD2,
                   relief="flat", cursor="hand2",
                   command=self._stop, width=10
@@ -1652,9 +1683,12 @@ class VideoResizerApp:
             if sys.platform == "win32":
                 os.startfile(d)
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", d])
+                subprocess.Popen(["open", str(d)])
             else:
-                subprocess.Popen(["xdg-open", d])
+                try:
+                    subprocess.Popen(["xdg-open", str(d)])
+                except FileNotFoundError:
+                    pass  # no file manager available
         except Exception as exc:
             log.error("_open_output: %s", exc)
 
