@@ -18,7 +18,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Homebrew dependencies (ffmpeg native)
+        run: |
+          brew install ffmpeg
+          ffmpeg -version | head -1
+          echo "ffmpeg path: $(which ffmpeg)"
+
+      - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install pyinstaller
@@ -28,33 +34,73 @@ jobs:
           pip install Pillow
           pip install ttkbootstrap
           pip install ultralytics
+          pip install mediapipe
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Verify imageio-ffmpeg (bundled ffmpeg)
+      - name: Verify all libraries
         run: |
           python3 -c "
-          import imageio_ffmpeg, os, subprocess
-          ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-          print(f'Bundled ffmpeg: {ffmpeg}')
-          print(f'Exists: {os.path.exists(ffmpeg)}')
-          r = subprocess.run([ffmpeg, '-version'], capture_output=True, text=True)
-          print(r.stdout.splitlines()[0])
-          print('imageio-ffmpeg OK!')
+          libs = {}
+          for name, mod in [
+              ('OpenCV',        'cv2'),
+              ('Pillow',        'PIL'),
+              ('ttkbootstrap',  'ttkbootstrap'),
+              ('ultralytics',   'ultralytics'),
+              ('torch',         'torch'),
+              ('moviepy',       'moviepy'),
+              ('mediapipe',     'mediapipe'),
+              ('imageio_ffmpeg','imageio_ffmpeg'),
+          ]:
+              try:
+                  m = __import__(mod)
+                  libs[name] = getattr(m, '__version__', 'OK')
+              except Exception as e:
+                  libs[name] = f'FAILED: {e}'
+          
+          import subprocess
+          r = subprocess.run(['ffmpeg','-version'], capture_output=True, text=True)
+          libs['ffmpeg'] = r.stdout.splitlines()[0] if r.returncode==0 else 'FAILED'
+          
+          for name, status in libs.items():
+              print(f'  {\"❌\" if \"FAILED\" in str(status) else \"✅\"} {name}: {status}')
           "
 
-      - name: Get imageio-ffmpeg binary path for bundling
-        id: ffmpeg_path
+      - name: Pre-download YOLOv8n model
         run: |
-          FFMPEG_PATH=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
-          FFMPEG_DIR=$(dirname "$FFMPEG_PATH")
-          echo "ffmpeg_path=$FFMPEG_PATH" >> $GITHUB_OUTPUT
-          echo "ffmpeg_dir=$FFMPEG_DIR"   >> $GITHUB_OUTPUT
-          echo "Bundling ffmpeg from: $FFMPEG_DIR"
+          python3 -c "
+          import os, shutil, glob
+          from ultralytics import YOLO
+          model = YOLO('yolov8n.pt')
+          
+          search_paths = ['yolov8n.pt', os.path.expanduser('~/yolov8n.pt')]
+          cache = os.path.expanduser('~/.cache/ultralytics')
+          if os.path.exists(cache):
+              search_paths += glob.glob(os.path.join(cache,'**','yolov8n.pt'), recursive=True)
+          
+          for loc in search_paths:
+              if os.path.exists(loc):
+                  dest = os.path.join(os.getcwd(), 'yolov8n.pt')
+                  if loc != dest:
+                      shutil.copy(loc, dest)
+                  print(f'yolov8n.pt ready: {os.path.getsize(dest)/1024/1024:.1f} MB')
+                  break
+          assert os.path.exists('yolov8n.pt'), 'Model not found!'
+          "
+
+      - name: Collect ffmpeg binary for bundling
+        run: |
+          python3 -c "
+          import imageio_ffmpeg, os, shutil
+          ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+          print(f'imageio_ffmpeg binary: {ffmpeg_path}')
+          if os.path.exists(ffmpeg_path):
+              shutil.copy(ffmpeg_path, 'ffmpeg_bundled')
+              os.chmod('ffmpeg_bundled', 0o755)
+              print(f'ffmpeg_bundled: {os.path.getsize(\"ffmpeg_bundled\")/1024/1024:.1f} MB')
+          "
 
       - name: Build macOS .app with PyInstaller
         run: |
-          FFMPEG_DIR=$(python3 -c "import imageio_ffmpeg, os; print(os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()))")
-
           pyinstaller \
             --windowed \
             --onedir \
@@ -73,11 +119,15 @@ jobs:
             --hidden-import ultralytics.models \
             --hidden-import ultralytics.models.yolo \
             --hidden-import ultralytics.nn \
+            --hidden-import ultralytics.nn.tasks \
             --hidden-import ultralytics.utils \
             --hidden-import moviepy \
             --hidden-import moviepy.editor \
             --hidden-import moviepy.video \
             --hidden-import moviepy.audio \
+            --hidden-import mediapipe \
+            --hidden-import mediapipe.python \
+            --hidden-import mediapipe.python.solutions \
             --hidden-import tkinter \
             --hidden-import tkinter.ttk \
             --hidden-import tkinter.filedialog \
@@ -90,41 +140,32 @@ jobs:
             --collect-all ttkbootstrap \
             --collect-all moviepy \
             --collect-all cv2 \
+            --collect-all mediapipe \
             --collect-all imageio_ffmpeg \
+            \
+            --add-data "yolov8n.pt:." \
+            --add-binary "ffmpeg_bundled:." \
             \
             --noconfirm \
             --clean \
             video_resizer_asif.py
 
-      - name: Verify ffmpeg inside .app bundle
+      - name: Verify bundle contents
         run: |
-          echo "=== Searching for ffmpeg inside .app ==="
-          find dist/VideoResizer.app -name "ffmpeg*" 2>/dev/null || echo "No ffmpeg binary found (will use imageio_ffmpeg at runtime)"
-
-          echo "=== Verifying imageio_ffmpeg can resolve inside bundle ==="
-          python3 -c "
-          import sys
-          # Simulate bundled environment
-          internal = 'dist/VideoResizer.app/Contents/MacOS/_internal'
-          sys.path.insert(0, internal)
-          try:
-              import imageio_ffmpeg
-              ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-              import os
-              print(f'ffmpeg path: {ffmpeg}')
-              print(f'ffmpeg exists: {os.path.exists(ffmpeg)}')
-              print('Bundle verification OK!')
-          except Exception as e:
-              print(f'Bundle verification note: {e}')
-              print('App will fall back to system ffmpeg if needed')
-          " 2>/dev/null || echo "Verification skipped - will test at runtime"
+          echo "=== Bundle size ==="
+          du -sh dist/VideoResizer.app
+          
+          echo ""
+          echo "=== Key files ==="
+          find dist/VideoResizer.app -name "yolov8n.pt" && echo "✅ yolov8n.pt OK" || echo "❌ yolov8n.pt MISSING"
+          find dist/VideoResizer.app -name "ffmpeg*"    && echo "✅ ffmpeg OK"     || echo "❌ ffmpeg MISSING"
+          find dist/VideoResizer.app -path "*/mediapipe*" -name "*.so" | head -3 && echo "✅ mediapipe OK" || echo "⚠️  mediapipe check"
 
       - name: Zip the .app for download
         run: |
           cd dist
           zip -r ../VideoResizer_macOS_SiarDigital_v5.3.zip VideoResizer.app
           cd ..
-          echo "=== Final zip size ==="
           du -sh VideoResizer_macOS_SiarDigital_v5.3.zip
 
       - name: Upload artifact
