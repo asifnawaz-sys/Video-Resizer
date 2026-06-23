@@ -121,36 +121,44 @@ jobs:
       - name: Pre-download YOLOv8n model
         run: |
           python3 -c "
-          import os, shutil
+          import os, shutil, glob
           from ultralytics import YOLO
-          
-          # Download model
-          model = YOLO('yolov8n.pt')
-          print('yolov8n.pt downloaded')
-          
-          # Find and copy to working directory
-          import glob
-          search_paths = [
-              'yolov8n.pt',
-              os.path.expanduser('~/yolov8n.pt'),
-              os.path.join(os.getcwd(), 'yolov8n.pt'),
-          ]
-          # Also search ultralytics cache
-          cache_dir = os.path.expanduser('~/.cache/ultralytics')
-          if os.path.exists(cache_dir):
-              for f in glob.glob(os.path.join(cache_dir, '**', 'yolov8n.pt'), recursive=True):
-                  search_paths.append(f)
-          
-          for loc in search_paths:
-              if os.path.exists(loc):
-                  dest = os.path.join(os.getcwd(), 'yolov8n.pt')
-                  if loc != dest:
+
+          dest = os.path.join(os.getcwd(), 'yolov8n.pt')
+
+          # If already exists in working dir (checked out from repo), skip download
+          if os.path.exists(dest):
+              print(f'yolov8n.pt already exists at: {dest}')
+              print(f'Size: {os.path.getsize(dest)/1024/1024:.1f} MB')
+          else:
+              # Download model
+              model = YOLO('yolov8n.pt')
+              print('yolov8n.pt downloaded')
+
+              # Search possible locations (excluding dest itself)
+              search_paths = [
+                  os.path.expanduser('~/yolov8n.pt'),
+              ]
+              # Also search ultralytics cache
+              cache_dir = os.path.expanduser('~/.cache/ultralytics')
+              if os.path.exists(cache_dir):
+                  for f in glob.glob(os.path.join(cache_dir, '**', 'yolov8n.pt'), recursive=True):
+                      search_paths.append(f)
+
+              copied = False
+              for loc in search_paths:
+                  if os.path.exists(loc) and os.path.abspath(loc) != os.path.abspath(dest):
                       shutil.copy(loc, dest)
-                  print(f'Model ready at: {dest}')
-                  print(f'Size: {os.path.getsize(dest)/1024/1024:.1f} MB')
-                  break
-          
-          assert os.path.exists('yolov8n.pt'), 'yolov8n.pt not found!'
+                      print(f'Copied from: {loc}')
+                      copied = True
+                      break
+
+              if not copied and not os.path.exists(dest):
+                  raise FileNotFoundError('yolov8n.pt not found after download!')
+
+          print(f'Model ready at: {dest}')
+          print(f'Size: {os.path.getsize(dest)/1024/1024:.1f} MB')
+          assert os.path.exists(dest), 'yolov8n.pt not found!'
           "
 
       - name: Pre-download rembg U2Net model
