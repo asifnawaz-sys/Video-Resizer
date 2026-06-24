@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Homebrew dependencies (ffmpeg native)
+      - name: Install Homebrew dependencies
         run: |
           brew install ffmpeg
           ffmpeg -version | head -1
@@ -42,80 +42,45 @@ jobs:
       - name: Verify all libraries
         run: |
           python3 -c "
+          import sys
           libs = {}
-          
-          try:
-              import cv2
-              libs['OpenCV'] = cv2.__version__
-          except Exception as e:
-              libs['OpenCV'] = f'FAILED: {e}'
-          
-          try:
-              import PIL
-              libs['Pillow'] = PIL.__version__
-          except Exception as e:
-              libs['Pillow'] = f'FAILED: {e}'
-          
-          try:
-              import customtkinter
-              libs['customtkinter'] = customtkinter.__version__
-          except Exception as e:
-              libs['customtkinter'] = f'FAILED: {e}'
-          
-          try:
-              import ultralytics
-              libs['ultralytics/YOLO'] = ultralytics.__version__
-          except Exception as e:
-              libs['ultralytics/YOLO'] = f'FAILED: {e}'
-          
-          try:
-              import torch
-              libs['torch'] = torch.__version__
-          except Exception as e:
-              libs['torch'] = f'FAILED: {e}'
-          
-          try:
-              import mediapipe
-              libs['mediapipe'] = mediapipe.__version__
-          except Exception as e:
-              libs['mediapipe'] = f'FAILED: {e}'
-          
-          try:
-              import rembg
-              libs['rembg'] = 'OK'
-          except Exception as e:
-              libs['rembg'] = f'FAILED: {e}'
-          
-          try:
-              import openpyxl
-              libs['openpyxl'] = openpyxl.__version__
-          except Exception as e:
-              libs['openpyxl'] = f'FAILED: {e}'
-          
-          try:
-              import imageio_ffmpeg
-              import os
-              ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-              libs['imageio_ffmpeg'] = f'OK -> {ffmpeg}'
-          except Exception as e:
-              libs['imageio_ffmpeg'] = f'FAILED: {e}'
 
-          try:
-              import subprocess
-              r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
-              libs['ffmpeg (system)'] = r.stdout.splitlines()[0] if r.returncode == 0 else 'FAILED'
-          except Exception as e:
-              libs['ffmpeg (system)'] = f'FAILED: {e}'
-          
-          print('=== LIBRARY STATUS ===')
+          for name, mod in [
+              ('customtkinter', 'customtkinter'),
+              ('Pillow',        'PIL'),
+              ('OpenCV',        'cv2'),
+              ('ultralytics',   'ultralytics'),
+              ('torch',         'torch'),
+              ('torchvision',   'torchvision'),
+              ('mediapipe',     'mediapipe'),
+              ('rembg',         'rembg'),
+              ('onnxruntime',   'onnxruntime'),
+              ('openpyxl',      'openpyxl'),
+              ('imageio_ffmpeg','imageio_ffmpeg'),
+          ]:
+              try:
+                  m = __import__(mod)
+                  libs[name] = getattr(m, '__version__', 'OK')
+              except Exception as e:
+                  libs[name] = f'FAILED: {e}'
+
+          import subprocess
+          r = subprocess.run(['ffmpeg','-version'], capture_output=True, text=True)
+          libs['ffmpeg (system)'] = r.stdout.splitlines()[0] if r.returncode==0 else 'FAILED'
+
           all_ok = True
+          print('=== LIBRARY STATUS ===')
           for name, status in libs.items():
-              icon = 'FAILED' in str(status)
-              print(f'  {\"❌\" if icon else \"✅\"} {name}: {status}')
-              if icon:
+              failed = 'FAILED' in str(status)
+              print(f'  {chr(10060) if failed else chr(9989)} {name}: {status}')
+              if failed:
                   all_ok = False
           print()
-          print('ALL OK' if all_ok else 'SOME LIBRARIES FAILED')
+          if not all_ok:
+              print('SOME LIBRARIES FAILED — aborting build')
+              sys.exit(1)
+          else:
+              print('ALL LIBRARIES OK')
           "
 
       - name: Pre-download YOLOv8n model
@@ -126,102 +91,96 @@ jobs:
 
           dest = os.path.join(os.getcwd(), 'yolov8n.pt')
 
-          # If already exists in working dir (checked out from repo), skip download
           if os.path.exists(dest):
-              print(f'yolov8n.pt already exists at: {dest}')
-              print(f'Size: {os.path.getsize(dest)/1024/1024:.1f} MB')
+              print(f'yolov8n.pt already exists ({os.path.getsize(dest)/1024/1024:.1f} MB)')
           else:
-              # Download model
-              model = YOLO('yolov8n.pt')
-              print('yolov8n.pt downloaded')
+              YOLO('yolov8n.pt')
+              search_paths = [os.path.expanduser('~/yolov8n.pt')]
+              cache = os.path.expanduser('~/.cache/ultralytics')
+              if os.path.exists(cache):
+                  search_paths += glob.glob(os.path.join(cache,'**','yolov8n.pt'), recursive=True)
 
-              # Search possible locations (excluding dest itself)
-              search_paths = [
-                  os.path.expanduser('~/yolov8n.pt'),
-              ]
-              # Also search ultralytics cache
-              cache_dir = os.path.expanduser('~/.cache/ultralytics')
-              if os.path.exists(cache_dir):
-                  for f in glob.glob(os.path.join(cache_dir, '**', 'yolov8n.pt'), recursive=True):
-                      search_paths.append(f)
-
-              copied = False
               for loc in search_paths:
                   if os.path.exists(loc) and os.path.abspath(loc) != os.path.abspath(dest):
                       shutil.copy(loc, dest)
                       print(f'Copied from: {loc}')
-                      copied = True
                       break
 
-              if not copied and not os.path.exists(dest):
-                  raise FileNotFoundError('yolov8n.pt not found after download!')
-
-          print(f'Model ready at: {dest}')
-          print(f'Size: {os.path.getsize(dest)/1024/1024:.1f} MB')
           assert os.path.exists(dest), 'yolov8n.pt not found!'
+          print(f'Model ready: {os.path.getsize(dest)/1024/1024:.1f} MB')
           "
 
       - name: Pre-download rembg U2Net model
         run: |
           python3 -c "
-          import os
-          print('Pre-downloading rembg U2Net model...')
-          try:
-              from rembg import remove
-              from PIL import Image
-              import io, numpy as np
-              # Small test to trigger model download
-              test_img = Image.new('RGB', (10, 10), (255,0,0))
-              buf = io.BytesIO()
-              test_img.save(buf, format='PNG')
-              result = remove(buf.getvalue())
-              print('rembg U2Net model downloaded OK')
-              
-              # Find where model was saved
-              cache_dirs = [
-                  os.path.expanduser('~/.cache/torch/hub'),
-                  os.path.expanduser('~/.u2net'),
-                  os.path.expanduser('~/Library/Application Support/rembg'),
-              ]
-              for d in cache_dirs:
-                  if os.path.exists(d):
-                      for root, dirs, files in os.walk(d):
-                          for f in files:
-                              if f.endswith('.onnx') or f.endswith('.pth'):
-                                  path = os.path.join(root, f)
-                                  print(f'Model file: {path} ({os.path.getsize(path)/1024/1024:.1f} MB)')
-          except Exception as e:
-              print(f'rembg model pre-download note: {e}')
-              print('rembg will download on first use if needed')
+          import os, shutil
+          from rembg import remove
+          from PIL import Image
+          import io
+
+          print('Downloading rembg U2Net model...')
+          test_img = Image.new('RGB', (10, 10), (255, 0, 0))
+          buf = io.BytesIO()
+          test_img.save(buf, format='PNG')
+          remove(buf.getvalue())
+          print('rembg model downloaded OK')
+
+          # Find and copy model to working dir for bundling
+          home = os.path.expanduser('~')
+          search_dirs = [
+              os.path.join(home, '.u2net'),
+              os.path.join(home, 'Library', 'Application Support', 'rembg'),
+              os.path.join(home, '.cache', 'rembg'),
+          ]
+          found = []
+          for d in search_dirs:
+              if os.path.exists(d):
+                  for root, dirs, files in os.walk(d):
+                      for f in files:
+                          if f.endswith('.onnx'):
+                              src = os.path.join(root, f)
+                              found.append(src)
+                              print(f'Found model: {src} ({os.path.getsize(src)/1024/1024:.1f} MB)')
+
+          # Copy models to working dir so PyInstaller can bundle them
+          if found:
+              os.makedirs('rembg_models', exist_ok=True)
+              for src in found:
+                  dst = os.path.join('rembg_models', os.path.basename(src))
+                  shutil.copy(src, dst)
+                  print(f'Copied to rembg_models/{os.path.basename(src)}')
+          else:
+              print('WARNING: No rembg .onnx models found — app will download on first use')
           "
 
       - name: Collect ffmpeg binary for bundling
         run: |
           python3 -c "
           import imageio_ffmpeg, os, shutil
-          
-          # Get bundled ffmpeg from imageio_ffmpeg
           ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-          print(f'imageio_ffmpeg bundled binary: {ffmpeg_path}')
-          print(f'Exists: {os.path.exists(ffmpeg_path)}')
-          
-          # Also get system ffmpeg (from brew)
-          import subprocess
-          r = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True)
-          sys_ffmpeg = r.stdout.strip()
-          print(f'System ffmpeg: {sys_ffmpeg}')
-          
-          # Copy both to working dir for bundling
+          print(f'imageio_ffmpeg binary: {ffmpeg_path}')
           if os.path.exists(ffmpeg_path):
               shutil.copy(ffmpeg_path, 'ffmpeg_bundled')
               os.chmod('ffmpeg_bundled', 0o755)
-              print(f'Copied imageio ffmpeg -> ffmpeg_bundled')
-          
-          print(f'ffmpeg_bundled ready: {os.path.exists(\"ffmpeg_bundled\")}')
+              print(f'ffmpeg_bundled: {os.path.getsize(\"ffmpeg_bundled\")/1024/1024:.1f} MB')
+          "
+
+      - name: Get mediapipe data path
+        run: |
+          python3 -c "
+          import mediapipe, os
+          mp_path = os.path.dirname(mediapipe.__file__)
+          print(f'mediapipe path: {mp_path}')
+          # Write path to env file for next step
+          with open('mediapipe_path.txt', 'w') as f:
+              f.write(mp_path)
           "
 
       - name: Build macOS .app with PyInstaller
         run: |
+          MP_PATH=$(cat mediapipe_path.txt)
+          echo "Mediapipe path: $MP_PATH"
+
           pyinstaller \
             --windowed \
             --onedir \
@@ -257,8 +216,13 @@ jobs:
             --hidden-import mediapipe.python.solutions.hands \
             --hidden-import mediapipe.python.solutions.pose \
             --hidden-import mediapipe.python.solutions.selfie_segmentation \
+            --hidden-import mediapipe.tasks \
+            --hidden-import mediapipe.tasks.python \
             --hidden-import rembg \
+            --hidden-import rembg.sessions \
+            --hidden-import rembg.sessions.u2net \
             --hidden-import onnxruntime \
+            --hidden-import onnxruntime.capi \
             --hidden-import openpyxl \
             --hidden-import openpyxl.styles \
             --hidden-import imageio_ffmpeg \
@@ -273,64 +237,82 @@ jobs:
             \
             --add-data "yolov8n.pt:." \
             --add-binary "ffmpeg_bundled:." \
+            --add-data "$MP_PATH:mediapipe" \
+            \
+            $([ -d "rembg_models" ] && echo '--add-data "rembg_models:rembg_models"' || echo '') \
             \
             --noconfirm \
             --clean \
             image_resizer_asif.py
 
-      - name: Verify all binaries inside .app bundle
+      - name: Verify bundle contents
         run: |
           echo "=== Bundle size ==="
           du -sh dist/ImageResizer.app
-          
+
           echo ""
           echo "=== Key files check ==="
-          
-          # yolov8n.pt
+
           if find dist/ImageResizer.app -name "yolov8n.pt" | grep -q .; then
             echo "✅ yolov8n.pt BUNDLED"
             find dist/ImageResizer.app -name "yolov8n.pt" -exec du -sh {} \;
           else
             echo "❌ yolov8n.pt MISSING"
           fi
-          
-          # ffmpeg
+
           if find dist/ImageResizer.app -name "ffmpeg*" | grep -q .; then
             echo "✅ ffmpeg BUNDLED"
-            find dist/ImageResizer.app -name "ffmpeg*"
           else
             echo "❌ ffmpeg MISSING"
           fi
-          
-          # mediapipe
-          if find dist/ImageResizer.app -path "*/mediapipe*" -name "*.so" | grep -q .; then
-            echo "✅ mediapipe native libs BUNDLED"
+
+          if find dist/ImageResizer.app -path "*/mediapipe*" | grep -q .; then
+            echo "✅ mediapipe BUNDLED"
+            find dist/ImageResizer.app -path "*/mediapipe*" -name "*.so" | head -3
           else
-            echo "⚠️  mediapipe .so not found (may still work via Python)"
+            echo "❌ mediapipe MISSING"
           fi
-          
-          # rembg / onnxruntime
+
           if find dist/ImageResizer.app -name "onnxruntime*" | grep -q .; then
-            echo "✅ onnxruntime BUNDLED (rembg backend)"
+            echo "✅ onnxruntime BUNDLED"
           else
-            echo "⚠️  onnxruntime not found"
+            echo "❌ onnxruntime MISSING"
           fi
-          
+
+          if find dist/ImageResizer.app -name "*.onnx" | grep -q .; then
+            echo "✅ rembg .onnx model BUNDLED"
+            find dist/ImageResizer.app -name "*.onnx" -exec du -sh {} \;
+          else
+            echo "⚠️  rembg .onnx model not bundled (will download on first use)"
+          fi
+
+          if find dist/ImageResizer.app -name "customtkinter*" | grep -q .; then
+            echo "✅ customtkinter BUNDLED"
+          else
+            echo "❌ customtkinter MISSING"
+          fi
+
           echo ""
-          echo "=== Top-level contents ==="
-          ls dist/ImageResizer.app/Contents/MacOS/_internal/ | head -30
+          echo "=== MacOS folder contents ==="
+          ls dist/ImageResizer.app/Contents/MacOS/ 2>/dev/null || echo "No MacOS folder"
+          echo ""
+          echo "=== _internal top contents ==="
+          ls dist/ImageResizer.app/Contents/MacOS/_internal/ 2>/dev/null | head -30 || \
+          ls dist/ImageResizer.app/Contents/Frameworks/ 2>/dev/null | head -20 || \
+          echo "Checking Resources..."
+          ls dist/ImageResizer.app/Contents/Resources/ 2>/dev/null | head -20
 
       - name: Zip the .app for download
         run: |
           cd dist
-          zip -r ../ImageResizer_macOS_SiarDigital_v4.1.zip ImageResizer.app
+          zip -r ../ImageResizer_macOS_SiarDigital_v4.2.zip ImageResizer.app
           cd ..
           echo "=== Final zip size ==="
-          du -sh ImageResizer_macOS_SiarDigital_v4.1.zip
+          du -sh ImageResizer_macOS_SiarDigital_v4.2.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ImageResizer-macOS-v4.1
-          path: ImageResizer_macOS_SiarDigital_v4.1.zip
+          name: ImageResizer-macOS-v4.2
+          path: ImageResizer_macOS_SiarDigital_v4.2.zip
           retention-days: 30
