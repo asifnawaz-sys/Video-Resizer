@@ -143,14 +143,16 @@ jobs:
                               print(f'Found model: {src} ({os.path.getsize(src)/1024/1024:.1f} MB)')
 
           # Copy models to working dir so PyInstaller can bundle them
+          # Always create folder so PyInstaller --add-data never fails
+          os.makedirs('rembg_models', exist_ok=True)
           if found:
-              os.makedirs('rembg_models', exist_ok=True)
               for src in found:
                   dst = os.path.join('rembg_models', os.path.basename(src))
                   shutil.copy(src, dst)
                   print(f'Copied to rembg_models/{os.path.basename(src)}')
           else:
-              print('WARNING: No rembg .onnx models found — app will download on first use')
+              with open('rembg_models/.keep', 'w') as f: f.write('placeholder')
+              print('WARNING: No rembg .onnx models — app will download on first use')
           "
 
       - name: Collect ffmpeg binary for bundling
@@ -239,7 +241,7 @@ jobs:
             --add-binary "ffmpeg_bundled:." \
             --add-data "$MP_PATH:mediapipe" \
             \
-            $([ -d "rembg_models" ] && echo '--add-data "rembg_models:rembg_models"' || echo '') \
+            --add-data "rembg_models:rembg_models" \
             \
             --noconfirm \
             --clean \
@@ -316,3 +318,4 @@ jobs:
           name: ImageResizer-macOS-v4.2
           path: ImageResizer_macOS_SiarDigital_v4.2.zip
           retention-days: 30
+
