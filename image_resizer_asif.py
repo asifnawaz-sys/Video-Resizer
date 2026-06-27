@@ -1,5 +1,5 @@
 """
-IMAGE RESIZER BY SIAR DIGITAL — Advanced Batch Engine v4.3
+IMAGE RESIZER BY SIAR DIGITAL — Advanced Batch Engine v4.4
 Created by Asif Nawaz | Siar Digital 2026
 
 FIXES v4.3:
@@ -218,13 +218,14 @@ CATEGORIES = {
 }
 
 MODE_TIPS = {
-    "Smart Crop (AI)":         "AI detects subject, crops to center it perfectly.",
-    "Mirror BG (Smart Fill)":  "Fills gaps with blurred mirror of image. No black bars!",
-    "AI Background Extend":    "Reconstructs/extends background to fill canvas.",
-    "Fill & Crop (Center)":    "Center-crop. No empty space.",
-    "Letterbox (Dark BG)":     "Black bars preserve full image.",
-    "Letterbox (White BG)":    "White bars for e-commerce.",
-    "Stretch to Fit":          "Distorts to exact size.",
+    "Smart Crop (AI)":           "AI detects subject, crops to center it perfectly.",
+    "Fashion Consistent (AI)":   "FASHION MODE: Identical model placement across all images. Head at fixed %, feet at fixed %. Perfect for e-commerce catalogs.",
+    "Mirror BG (Smart Fill)":    "Fills gaps with blurred mirror of image. No black bars!",
+    "AI Background Extend":      "Reconstructs/extends background to fill canvas.",
+    "Fill & Crop (Center)":      "Center-crop. No empty space.",
+    "Letterbox (Dark BG)":       "Black bars preserve full image.",
+    "Letterbox (White BG)":      "White bars for e-commerce.",
+    "Stretch to Fit":            "Distorts to exact size.",
 }
 
 msg_queue = queue.Queue()
@@ -539,14 +540,101 @@ def engine_letterbox_white(img, tw, th, **_):
 def engine_stretch(img, tw, th, **_):
     return img.resize((tw, th), Image.Resampling.LANCZOS)
 
+
+def engine_fashion_consistent(img, tw, th, category="General", **_):
+    """
+    Fashion Consistent Engine v2.0 — Siar Digital
+    -----------------------------------------------
+    Designed for clothing/fashion e-commerce.
+    ALL images get identical model placement — head at same %, feet at same %.
+    Original background preserved — NO blur, NO fill, NO stretch.
+
+    Logic:
+    1. Detect person bbox (YOLO → CV face → saliency)
+    2. Scale full image so person_h fits target zone
+    3. Crop canvas from scaled image — model always same position
+    4. 100% original background — nothing added
+    """
+    # ── Placement targets ─────────────────────────────────────────────────
+    HEAD_TOP_PCT = 0.06   # head at 6% from top
+    FEET_BOT_PCT = 0.04   # feet at 4% from bottom
+
+    iw, ih = img.size
+
+    # ── Step 1: Detect person ─────────────────────────────────────────────
+    bbox = None
+    if HAS_YOLO:
+        bbox = _detect_person_bbox_yolo(img, category)
+    if bbox is None and HAS_OPENCV:
+        bbox = _detect_person_bbox_cv(img, category)
+    if bbox is None and HAS_OPENCV:
+        bbox = _detect_person_bbox_saliency(img)
+
+    if bbox is None:
+        log.info("Fashion engine: no detection → smart crop fallback")
+        return engine_smart_crop(img, tw, th, category=category)
+
+    person_top    = max(0,  bbox["head_top"])
+    person_bottom = min(ih, bbox["feet_bottom"])
+    person_left   = max(0,  bbox["body_left"])
+    person_right  = min(iw, bbox["body_right"])
+    person_cx     = (person_left + person_right) // 2
+    person_h      = person_bottom - person_top
+
+    if person_h < 50:
+        log.info("Fashion engine: bbox too small → smart crop fallback")
+        return engine_smart_crop(img, tw, th, category=category)
+
+    # ── Step 2: Scale so person fits target zone ──────────────────────────
+    target_person_h = int(th * (1.0 - HEAD_TOP_PCT - FEET_BOT_PCT))
+    scale = target_person_h / max(person_h, 1)
+
+    scaled_iw = int(iw * scale)
+    scaled_ih = int(ih * scale)
+    scaled_img = img.resize((scaled_iw, scaled_ih), Image.Resampling.LANCZOS)
+
+    # Person position in scaled image
+    scaled_person_top = int(person_top * scale)
+    scaled_person_cx  = int(person_cx  * scale)
+
+    # ── Step 3: Crop box from scaled image ────────────────────────────────
+    # Vertical: top of crop so that person_top lands at HEAD_TOP_PCT
+    crop_top = scaled_person_top - int(th * HEAD_TOP_PCT)
+
+    # Horizontal: center person horizontally
+    crop_left = scaled_person_cx - tw // 2
+
+    # Clamp — do not go outside scaled image
+    crop_top  = max(0, min(crop_top,  scaled_ih - th))
+    crop_left = max(0, min(crop_left, scaled_iw - tw))
+
+    crop_bottom = crop_top  + th
+    crop_right  = crop_left + tw
+
+    # Final safety clamp
+    crop_bottom = min(crop_bottom, scaled_ih)
+    crop_right  = min(crop_right,  scaled_iw)
+
+    result = scaled_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+    # If crop is smaller than target (edge case), resize to exact
+    if result.size != (tw, th):
+        result = result.resize((tw, th), Image.Resampling.LANCZOS)
+
+    log.info(f"Fashion engine: person_h={person_h} scale={scale:.3f} "
+             f"crop=({crop_left},{crop_top})-({crop_right},{crop_bottom})")
+
+    return result
+
 MODE_MAP = {
-    "Smart Crop (AI)":         engine_smart_crop,
-    "Mirror BG (Smart Fill)":  engine_mirror_bg,
-    "AI Background Extend":    engine_ai_bg_extend,
-    "Fill & Crop (Center)":    engine_fill_crop,
-    "Letterbox (Dark BG)":     engine_letterbox_dark,
-    "Letterbox (White BG)":    engine_letterbox_white,
-    "Stretch to Fit":          engine_stretch,
+    "Smart Crop (AI)":           engine_smart_crop,
+    "Fashion Consistent (AI)":   engine_fashion_consistent,
+    "Mirror BG (Smart Fill)":    engine_mirror_bg,
+    "AI Background Extend":      engine_ai_bg_extend,
+    "Fill & Crop (Center)":      engine_fill_crop,
+    "Letterbox (Dark BG)":       engine_letterbox_dark,
+    "Letterbox (White BG)":      engine_letterbox_white,
+    "Stretch to Fit":            engine_stretch,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -887,7 +975,7 @@ class ImageResizerPro(ctk.CTk):
         self.speed_var     = ctk.StringVar(value="0.0 img/s")
         self._build_ui()
         self._poll_queue()
-        log.info(f"Image Resizer v4.3 started | OS={_OS}")
+        log.info(f"Image Resizer v4.4 started | OS={_OS}")
 
     def _build_ui(self):
         self._build_header()
@@ -910,7 +998,7 @@ class ImageResizerPro(ctk.CTk):
         ctk.CTkLabel(left_hdr, text="▶  IMAGE RESIZER BY SIAR DIGITAL",
                      font=FONTS["hero"], text_color=C["accent"]).pack(anchor="w")
         ctk.CTkLabel(left_hdr,
-                     text="Advanced Batch Engine v4.3  |  AI Detection  |  Smart Fill  |  All Libraries Bundled",
+                     text="Advanced Batch Engine v4.4  |  AI Detection  |  Smart Fill  |  All Libraries Bundled",
                      font=FONTS["subtitle"], text_color=C["text2"]).pack(anchor="w")
         right_hdr = ctk.CTkFrame(hdr, fg_color="transparent")
         right_hdr.pack(side="right", padx=20)
