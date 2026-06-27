@@ -1,6 +1,10 @@
 """
-IMAGE RESIZER BY SIAR DIGITAL — Advanced Batch Engine v4.2
+IMAGE RESIZER BY SIAR DIGITAL — Advanced Batch Engine v4.3
 Created by Asif Nawaz | Siar Digital 2026
+
+FIXES v4.3:
+  - FIX: scan_image_files now skips macOS hidden files (._filename, .DS_Store)
+    These were causing double count and fake failures in audit report
 
 FIXES v4.2:
   - CRITICAL: engine_smart_crop was calling non-existent _cv_fixed/_saliency_fixed
@@ -590,6 +594,9 @@ def scan_image_files(input_path):
     for root, dirs, files in os.walk(input_path):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for fname in files:
+            # FIX v4.3: Skip macOS hidden metadata files (._filename, .DS_Store etc)
+            if fname.startswith("._") or fname.startswith("."):
+                continue
             if fname.lower().endswith(SUPPORTED_EXTS):
                 abs_path = os.path.normpath(os.path.join(root, fname))
                 rel_path = os.path.relpath(abs_path, input_path)
@@ -880,7 +887,7 @@ class ImageResizerPro(ctk.CTk):
         self.speed_var     = ctk.StringVar(value="0.0 img/s")
         self._build_ui()
         self._poll_queue()
-        log.info(f"Image Resizer v4.2 started | OS={_OS}")
+        log.info(f"Image Resizer v4.3 started | OS={_OS}")
 
     def _build_ui(self):
         self._build_header()
@@ -903,7 +910,7 @@ class ImageResizerPro(ctk.CTk):
         ctk.CTkLabel(left_hdr, text="▶  IMAGE RESIZER BY SIAR DIGITAL",
                      font=FONTS["hero"], text_color=C["accent"]).pack(anchor="w")
         ctk.CTkLabel(left_hdr,
-                     text="Advanced Batch Engine v4.2  |  AI Detection  |  Smart Fill  |  All Libraries Bundled",
+                     text="Advanced Batch Engine v4.3  |  AI Detection  |  Smart Fill  |  All Libraries Bundled",
                      font=FONTS["subtitle"], text_color=C["text2"]).pack(anchor="w")
         right_hdr = ctk.CTkFrame(hdr, fg_color="transparent")
         right_hdr.pack(side="right", padx=20)
