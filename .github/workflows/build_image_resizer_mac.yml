@@ -8,6 +8,7 @@ on:
 jobs:
   build-macos-app:
     runs-on: macos-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout code
@@ -62,7 +63,6 @@ jobs:
                   libs[name] = f'MISSING: {e}'
           critical = ['customtkinter','Pillow','OpenCV','ultralytics','torch','openpyxl']
           all_ok = True
-          print('=== LIBRARY STATUS ===')
           for name, status in libs.items():
               fail = 'FAILED' in str(status)
               miss = 'MISSING' in str(status)
@@ -70,48 +70,32 @@ jobs:
               print(f'  [{icon}] {name}: {status}')
               if fail and name in critical: all_ok = False
           if not all_ok:
-              print('CRITICAL LIBRARY FAILED')
               sys.exit(1)
           print('All critical libraries OK')
           "
 
-      - name: Pre-download yolov8n.pt (Smart Crop engine)
+      # ── Download yolov8n.pt via wget (no Python hang risk) ─────────────────
+      - name: Download yolov8n.pt model
         run: |
-          python3 -c "
-          import os, shutil, glob
-          from ultralytics import YOLO
-          dest = os.path.join(os.getcwd(), 'yolov8n.pt')
-          if not os.path.exists(dest):
-              YOLO('yolov8n.pt')
-              for loc in [os.path.expanduser('~/yolov8n.pt')] + \
-                         glob.glob(os.path.expanduser('~/.cache/ultralytics/**/yolov8n.pt'), recursive=True):
-                  if os.path.exists(loc):
-                      shutil.copy(loc, dest); break
-          assert os.path.exists(dest)
-          print(f'yolov8n.pt: {os.path.getsize(dest)/1024/1024:.1f} MB')
-          "
+          wget -q --show-progress \
+            "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n.pt" \
+            -O yolov8n.pt
+          ls -lh yolov8n.pt
 
-      - name: Pre-download yolov8m-pose.pt (Pose AI SOTA engine)
+      # ── Download yolov8m-pose.pt via wget (no Python hang risk) ────────────
+      - name: Download yolov8m-pose.pt model
         run: |
-          python3 -c "
-          import os, shutil, glob
-          from ultralytics import YOLO
-          dest = os.path.join(os.getcwd(), 'yolov8m-pose.pt')
-          if not os.path.exists(dest):
-              YOLO('yolov8m-pose.pt')
-              candidates = [os.path.expanduser('~/yolov8m-pose.pt')] + \
-                           glob.glob(os.path.expanduser('~/**/*pose*.pt'), recursive=True)
-              for loc in candidates:
-                  if os.path.exists(loc) and 'pose' in loc:
-                      shutil.copy(loc, dest); print(f'Copied from: {loc}'); break
-          assert os.path.exists(dest), 'yolov8m-pose.pt not found!'
-          print(f'yolov8m-pose.pt: {os.path.getsize(dest)/1024/1024:.1f} MB')
-          "
+          wget -q --show-progress \
+            "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8m-pose.pt" \
+            -O yolov8m-pose.pt
+          ls -lh yolov8m-pose.pt
 
+      # ── rembg model ─────────────────────────────────────────────────────────
       - name: Pre-download rembg U2Net model
         run: |
           python3 -c "
           import os, shutil
+          os.makedirs('rembg_models', exist_ok=True)
           try:
               from rembg import remove
               from PIL import Image
@@ -121,25 +105,26 @@ jobs:
               remove(buf.getvalue())
               print('rembg model downloaded OK')
           except Exception as e:
-              print(f'rembg optional — skipping: {e}')
-          os.makedirs('rembg_models', exist_ok=True)
+              print(f'rembg optional: {e}')
+          home = os.path.expanduser('~')
           found = []
-          for d in [os.path.expanduser('~/.u2net'),
-                    os.path.expanduser('~/Library/Application Support/rembg'),
-                    os.path.expanduser('~/.cache/rembg')]:
+          for d in [home+'/.u2net',
+                    home+'/Library/Application Support/rembg',
+                    home+'/.cache/rembg']:
               if os.path.exists(d):
                   for root,dirs,files in os.walk(d):
                       for f in files:
                           if f.endswith('.onnx'):
                               src = os.path.join(root, f)
-                              shutil.copy(src, os.path.join('rembg_models', f))
+                              shutil.copy(src, 'rembg_models/'+f)
                               found.append(f)
                               print(f'Bundled: {f}')
           if not found:
               open('rembg_models/.keep','w').write('placeholder')
-              print('No rembg models — will download on first use')
-          "
+              print('No rembg models found')
+          " || true
 
+      # ── ffmpeg binary ────────────────────────────────────────────────────────
       - name: Collect ffmpeg binary
         run: |
           python3 -c "
@@ -263,16 +248,10 @@ jobs:
           echo "=== Bundle size ===" && du -sh dist/ImageResizer.app
           for f in yolov8n.pt yolov8m-pose.pt; do
             find dist/ImageResizer.app -name "$f" | grep -q . \
-              && echo "OK $f bundled" \
-              || echo "MISSING $f"
+              && echo "OK $f bundled" || echo "MISSING $f"
           done
-          for check in ffmpeg mediapipe onnxruntime customtkinter; do
-            find dist/ImageResizer.app -iname "*${check}*" | grep -q . \
-              && echo "OK $check" || echo "? $check not found"
-          done
-          find dist/ImageResizer.app -name "*.onnx" | grep -q . \
-            && echo "OK rembg .onnx bundled" || echo "? rembg .onnx not bundled"
-          echo "" && ls dist/ImageResizer.app/Contents/MacOS/ 2>/dev/null | head -10
+          echo "=== App Contents ==="
+          ls dist/ImageResizer.app/Contents/MacOS/ 2>/dev/null | head -10
 
       - name: Zip the .app
         run: |
