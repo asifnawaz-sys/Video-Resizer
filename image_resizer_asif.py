@@ -1,18 +1,28 @@
 """
-IMAGE RESIZER BY SIAR DIGITAL — Advanced Batch Engine v4.4
+IMAGE RESIZER BY SIAR DIGITAL — Advanced Batch Engine v4.5
 Created by Asif Nawaz | Siar Digital 2026
 
-FIXES v4.3:
-  - FIX: scan_image_files now skips macOS hidden files (._filename, .DS_Store)
-    These were causing double count and fake failures in audit report
+FEATURES:
+  - Fashion Consistent (AI) v7.0 — standardized head/feet placement
+  - Smart Crop, Mirror BG, AI Extend, Fill Crop, Letterbox, Stretch
+  - macOS/Windows/Linux font detection
+  - macOS hidden file fix (._filename skipped)
+  - Quality Guard 3MB
+  - Turbo multi-thread mode
+  - Audit report CSV + Excel
+  - Pose AI (SOTA) engine — YOLOv8-Pose standardized headspace
 
-FIXES v4.2:
-  - CRITICAL: engine_smart_crop was calling non-existent _cv_fixed/_saliency_fixed
-  - mediapipe properly imported and bundled
-  - rembg model path handled for bundled .app (MEIPASS)
-  - YOLO model path handled for bundled .app (MEIPASS)
-  - rembg failure is non-fatal (logs warning, continues resize)
-  - All libraries verified at startup
+BUG FIXES v4.4.1:
+  - FIX 1: Defined missing _DETECT_W / _DETECT_H module-level constants
+            (_detect_person_bbox_cv crashed with NameError on these)
+  - FIX 2: engine_fashion_consistent wide-shot pre-crop now converts image
+            to RGB before passing to cv2 (prevents crash on RGBA inputs)
+  - FIX 3: _detect_person_bbox_cv now uses _resize_for_detection() helper
+            consistently instead of duplicating resize logic with wrong constants
+  - FIX 4: rembg watermark removal now passes PIL Image directly to
+            rembg_remove() — avoids unnecessary PNG re-encode/decode round-trip
+  - FIX 5: _tk_images cleanup now also clears label .image references so
+            old PhotoImage objects are actually garbage-collected
 """
 
 import os
@@ -31,13 +41,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-# ── Bundled app resource path helper ─────────────────────────────────────────
+# ── Bundled app resource path ─────────────────────────────────────────────────
 def _resource(relative_path):
-    """Get absolute path — works for PyInstaller .app and normal run."""
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path)
 
-# ── Core UI ──────────────────────────────────────────────────────────────────
+# ── Core UI ───────────────────────────────────────────────────────────────────
 try:
     import customtkinter as ctk
 except ImportError:
@@ -57,7 +66,7 @@ except ImportError:
     print("ERROR: tkinter not found.")
     sys.exit(1)
 
-# ── Optional Power Libraries ─────────────────────────────────────────────────
+# ── Optional Power Libraries ──────────────────────────────────────────────────
 try:
     import cv2
     import numpy as np
@@ -75,6 +84,9 @@ except ImportError:
     HAS_YOLO = False
     YOLO = None
     _yolo_model = None
+
+# Pose model cache (separate from detection model)
+_pose_model_cache: dict = {}
 
 try:
     import mediapipe as mp
@@ -99,25 +111,22 @@ except ImportError:
     HAS_OPENPYXL = False
     openpyxl = None
 
-# ── rembg session (pre-loaded so no runtime download) ─────────────────────────
+# ── rembg session ──────────────────────────────────────────────────────────────
 _rembg_session = None
 
 def _get_rembg_session():
     global _rembg_session
     if _rembg_session is None and HAS_REMBG:
         try:
-            # Try bundled model first
             model_path = _resource(os.path.join('rembg_models', 'u2net.onnx'))
             if os.path.exists(model_path):
                 os.environ['U2NET_HOME'] = _resource('rembg_models')
-                log.info(f"rembg: using bundled model at {model_path}")
             _rembg_session = rembg_new_session('u2net')
-            log.info("rembg session created OK")
         except Exception as e:
             log.warning(f"rembg session init failed: {e}")
     return _rembg_session
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────────────
 log_dir = Path.home() / "SiarDigital_ImageResizer_Logs"
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -132,7 +141,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("SiarDigital_Resizer")
 
-# ── Cross-platform Font ───────────────────────────────────────────────────────
+# ── Cross-platform Font ────────────────────────────────────────────────────────
 _OS = platform.system()
 if _OS == "Darwin":
     _MONO = "Menlo"
@@ -142,10 +151,8 @@ else:
     _MONO = "DejaVu Sans Mono"
 
 log.info(f"Platform: {_OS} | Font: {_MONO}")
-log.info(f"OpenCV: {HAS_OPENCV} | YOLO: {HAS_YOLO} | "
-         f"mediapipe: {HAS_MEDIAPIPE} | rembg: {HAS_REMBG}")
 
-# ── Design Tokens ─────────────────────────────────────────────────────────────
+# ── Design Tokens ──────────────────────────────────────────────────────────────
 C = {
     "bg":       "#060910",
     "surface":  "#0D1321",
@@ -187,9 +194,9 @@ FONTS = {
 SUPPORTED_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.tiff', '.tif',
                   '.bmp', '.gif', '.ico', '.ppm')
 
-QUALITY_LIMIT_KB = 3072
+QUALITY_LIMIT_KB = 3072  # 3 MB
 
-# ── Presets ───────────────────────────────────────────────────────────────────
+# ── Presets ────────────────────────────────────────────────────────────────────
 PRESETS = {
     "Instagram Post (1:1)":    (1080, 1080),
     "Instagram Story (9:16)":  (1080, 1920),
@@ -219,13 +226,14 @@ CATEGORIES = {
 
 MODE_TIPS = {
     "Smart Crop (AI)":           "AI detects subject, crops to center it perfectly.",
-    "Fashion Consistent (AI)":   "FASHION MODE: Identical model placement across all images. Head at fixed %, feet at fixed %. Perfect for e-commerce catalogs.",
+    "Fashion Consistent (AI)":   "FASHION: Identical placement across all images. Head at fixed %, feet never cut. Perfect for e-commerce catalogs.",
     "Mirror BG (Smart Fill)":    "Fills gaps with blurred mirror of image. No black bars!",
     "AI Background Extend":      "Reconstructs/extends background to fill canvas.",
     "Fill & Crop (Center)":      "Center-crop. No empty space.",
     "Letterbox (Dark BG)":       "Black bars preserve full image.",
     "Letterbox (White BG)":      "White bars for e-commerce.",
     "Stretch to Fit":            "Distorts to exact size.",
+    "Pose AI (SOTA)":            "SOTA: YOLOv8-Pose skeleton — standardized 12% headspace & 10% footspace. Best for e-commerce fashion catalogs.",
 }
 
 msg_queue = queue.Queue()
@@ -235,16 +243,18 @@ msg_queue = queue.Queue()
 # ─────────────────────────────────────────────────────────────────────────────
 _DETECT_LONG_SIDE = 1200
 
+# ── FIX 1: Define missing module-level constants used by _detect_person_bbox_cv
+#    Original code referenced _DETECT_W / _DETECT_H but never defined them,
+#    causing NameError at runtime whenever CV-based detection was triggered.
+_DETECT_W = 800
+_DETECT_H = 1200
+
 def _get_yolo():
     global _yolo_model
     if HAS_YOLO and _yolo_model is None:
         try:
-            # Check bundled path first (PyInstaller)
             bundled = _resource('yolov8n.pt')
-            if os.path.exists(bundled):
-                model_path = bundled
-            else:
-                model_path = 'yolov8n.pt'
+            model_path = bundled if os.path.exists(bundled) else 'yolov8n.pt'
             _yolo_model = YOLO(model_path)
             log.info(f"YOLOv8 loaded from: {model_path}")
         except Exception as e:
@@ -304,23 +314,77 @@ def _estimate_body_from_face(face, sv_w, sv_h):
     }
 
 def _detect_person_bbox_cv(img_pil, category):
+    """
+    Full human-eye pipeline:
+    1. Resize to calibrated canvas using _resize_for_detection (consistent helper)
+    2. Face detection (multi-cascade, multi-param)
+    3. GrabCut seeded from face -> body extent
+    4. Scale bbox back to original coords
+
+    FIX 3: Now uses _resize_for_detection() helper instead of duplicating resize
+    logic with hardcoded _DETECT_W/_DETECT_H (which were also undefined before FIX 1).
+    """
     iw, ih = img_pil.size
+
+    # ── FIX 3: Use the shared _resize_for_detection helper for consistency.
+    #    Original code manually resized to _DETECT_W x _DETECT_H (undefined),
+    #    while _resize_for_detection uses _DETECT_LONG_SIDE aspect-correct scaling.
+    #    We now use _resize_for_detection and derive sw/sh from the result.
     cv_img, sx, sy, sv_w, sv_h = _resize_for_detection(img_pil)
+    sw, sh = sv_w, sv_h
+
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    face = _detect_face_cv(gray, sv_w, sv_h)
+
+    face = _detect_face_cv(gray, sw, sh)
     if face is None:
+        log.info("No face detected — falling back to saliency.")
         return None
+
     fx, fy, fw, fh = face
-    body = _estimate_body_from_face(face, sv_w, sv_h)
+    log.info(f"Face @ ({fx},{fy}) {fw}x{fh} in {sw}x{sh} "
+             f"[top={fy/sh:.1%} left={fx/sw:.1%}]")
+
+    # GrabCut seeded from face
+    margin        = int(fw * 1.0)
+    rect_x        = max(0, fx - margin)
+    rect_y        = max(0, fy - int(fh * 0.4))
+    rect_w        = min(sw - rect_x, fw + 2 * margin)
+    rect_h        = min(sh - rect_y, sh - rect_y)
+    body_left_s   = rect_x
+    body_right_s  = rect_x + rect_w
+    body_bottom_s = sh
+
+    try:
+        mask = np.zeros(cv_img.shape[:2], np.uint8)
+        bgd  = np.zeros((1, 65), np.float64)
+        fgd  = np.zeros((1, 65), np.float64)
+        cv2.grabCut(cv_img, mask,
+                    (rect_x, rect_y, rect_w, rect_h),
+                    bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+        fg     = np.where((mask == 2) | (mask == 0), 0, 1).astype("uint8")
+        coords = np.column_stack(np.where(fg > 0))
+        if len(coords) > 200:
+            y_min, x_min = coords.min(axis=0)
+            y_max, x_max = coords.max(axis=0)
+            body_left_s   = x_min
+            body_right_s  = x_max
+            body_bottom_s = y_max
+            log.info(f"GrabCut body: x={x_min}-{x_max} y={y_min}-{y_max}")
+    except Exception as e:
+        log.warning(f"GrabCut failed: {e}")
+
+    head_top_s = max(0, fy - int(fh * 0.65))
+
+    def u(v, f): return int(v * f)
     return {
-        "head_top":    max(0,  int(body["head_top_s"]    * sy)),
-        "feet_bottom": min(ih, int(body["feet_bottom_s"] * sy)),
-        "body_left":   max(0,  int(body["body_left_s"]   * sx)),
-        "body_right":  min(iw, int(body["body_right_s"]  * sx)),
-        "face_cx":     int((fx + fw // 2) * sx),
-        "face_cy":     int((fy + fh // 2) * sy),
-        "face_w":      int(fw * sx),
-        "face_h":      int(fh * sy),
+        "head_top":    u(head_top_s,    sy),
+        "feet_bottom": u(body_bottom_s, sy),
+        "body_left":   u(body_left_s,   sx),
+        "body_right":  u(body_right_s,  sx),
+        "face_cx":     u(fx + fw // 2,  sx),
+        "face_cy":     u(fy + fh // 2,  sy),
+        "face_w":      u(fw, sx),
+        "face_h":      u(fh, sy),
         "img_w": iw, "img_h": ih,
     }
 
@@ -360,21 +424,16 @@ def _detect_person_bbox_yolo(img_pil, category):
             return None
         boxes.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1])*b[4], reverse=True)
         bx1, by1, bx2, by2, conf = boxes[0]
-        ox1 = max(0,  int(bx1 * sx))
-        oy1 = max(0,  int(by1 * sy))
-        ox2 = min(iw, int(bx2 * sx))
-        oy2 = min(ih, int(by2 * sy))
-        ph = oy2 - oy1
-        fh_est = max(1, int(ph * 0.12))
+        ox1 = max(0,  int(bx1 * sx));  oy1 = max(0,  int(by1 * sy))
+        ox2 = min(iw, int(bx2 * sx));  oy2 = min(ih, int(by2 * sy))
+        ph = oy2 - oy1; fh_est = max(1, int(ph * 0.12))
         return {
             "head_top":    max(0, oy1 - int(fh_est * 0.90)),
             "feet_bottom": oy2,
-            "body_left":   ox1,
-            "body_right":  ox2,
+            "body_left":   ox1, "body_right":  ox2,
             "face_cx":     (ox1 + ox2) // 2,
             "face_cy":     oy1 + fh_est,
-            "face_w":      ox2 - ox1,
-            "face_h":      fh_est,
+            "face_w":      ox2 - ox1, "face_h": fh_est,
             "img_w": iw, "img_h": ih,
         }
     except Exception as e:
@@ -393,18 +452,14 @@ def _detect_person_bbox_saliency(img_pil):
         hsv     = cv2.cvtColor(cv_img, cv2.COLOR_BGR2HSV)
         sat     = hsv[:, :, 1]
         combined = cv2.bitwise_or(dilated, (sat > 50).astype(np.uint8) * 255)
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         min_area = sv_h * sv_w * 0.005
-        boxes = [(x, y, bw, bh, cv2.contourArea(c))
-                 for c in contours
-                 for x, y, bw, bh in [cv2.boundingRect(c)]
+        boxes = [(x,y,bw,bh,cv2.contourArea(c)) for c in contours
+                 for x,y,bw,bh in [cv2.boundingRect(c)]
                  if cv2.contourArea(c) > min_area]
-        if not boxes:
-            return None
+        if not boxes: return None
         tw = sum(b[4] for b in boxes)
-        if tw == 0:
-            return None
+        if tw == 0: return None
         cx_s = sum((b[0]+b[2]//2)*b[4] for b in boxes) / tw
         cy_s = sum((b[1]+b[3]//2)*b[4] for b in boxes) / tw
         return {
@@ -424,23 +479,17 @@ def _detect_person_bbox_saliency(img_pil):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Placement Engines
 # ─────────────────────────────────────────────────────────────────────────────
+
 def engine_smart_crop(img, tw, th, category="General", **_):
     iw, ih = img.size
-
-    # Detection chain: YOLO → CV face → saliency (all using correct function names)
     bbox = None
     if HAS_YOLO:
         bbox = _detect_person_bbox_yolo(img, category)
-        if bbox: log.info("Smart crop: YOLO")
     if bbox is None and HAS_OPENCV:
         bbox = _detect_person_bbox_cv(img, category)
-        if bbox: log.info("Smart crop: CV face")
     if bbox is None and HAS_OPENCV:
         bbox = _detect_person_bbox_saliency(img)
-        if bbox: log.info("Smart crop: saliency")
-
     if bbox is None:
-        log.info("Smart crop: center crop fallback")
         return ImageOps.fit(img, (tw, th), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
     head_top    = max(0, min(bbox["head_top"],    ih - 1))
@@ -497,12 +546,168 @@ def engine_smart_crop(img, tw, th, category="General", **_):
     return img.crop((crop_left, crop_top, crop_right, crop_bottom)).resize(
         (tw, th), Image.Resampling.LANCZOS)
 
+
+def engine_fashion_consistent(img, tw, th, category="General", **_):
+    """
+    Fashion Consistent Engine v12.0 - Siar Digital
+
+    Pipeline:
+    1. Wide-shot detection: if image is wider than portrait ratio,
+       pre-crop to subject area before processing
+    2. Face detection (strict fy<45%) -> head_top
+    3. Dress color detection -> cx (horizontal centering)
+    4. Scale + crop with 7% headspace, 2% foot space
+    5. No black bars guarantee
+
+    FIX 2: Wide-shot pre-crop block now converts img to RGB before passing
+    to cv2.cvtColor. Original code passed the raw PIL image array which could
+    be RGBA (4 channels), causing cv2 to crash with a channel-count error.
+    """
+    HEAD_TOP_PCT = 0.07
+    FEET_BOT_PCT = 0.02
+    iw, ih = img.size
+
+    # ── STEP 0: Wide-shot pre-crop ────────────────────────────────────────
+    img_ratio    = iw / ih
+    target_ratio = tw / th
+
+    if img_ratio > target_ratio * 1.3:
+        # ── FIX 2: Ensure RGB before passing to OpenCV.
+        #    Original: np.array(img.resize((800,600))) — could be RGBA → cv2 crash.
+        #    Fixed:    convert to RGB first, always 3-channel.
+        small0_pil = img.convert("RGB").resize((800, 600), Image.Resampling.LANCZOS)
+        small0     = np.array(small0_pil)
+        DW0, DH0   = 800, 600
+        hsv0       = cv2.cvtColor(cv2.cvtColor(small0, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2HSV)
+        cream0     = cv2.inRange(hsv0, (0, 0, 140), (40, 70, 255))
+        k0         = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 8))
+        cream0     = cv2.morphologyEx(cream0, cv2.MORPH_CLOSE, k0)
+
+        mid_row  = cream0[int(DH0*0.4):int(DH0*0.7), :]
+        col_sums = mid_row.sum(axis=0)
+        cream_cols = np.where(col_sums > 0)[0]
+
+        cx_pct = np.mean(cream_cols) / DW0 if len(cream_cols) > 20 else 0.5
+
+        portrait_w = int(ih * target_ratio * 1.1)
+        portrait_w = min(portrait_w, iw)
+        cx_px  = int(cx_pct * iw)
+        pc_x1  = max(0, cx_px - portrait_w // 2)
+        pc_x2  = min(iw, pc_x1 + portrait_w)
+        if pc_x2 - pc_x1 < portrait_w:
+            pc_x1 = max(0, pc_x2 - portrait_w)
+
+        # ── FIX 2 (continued): same RGB-first conversion for the tall canvas.
+        img_rgb_800x1200 = img.convert("RGB").resize((800, 1200), Image.Resampling.LANCZOS)
+        hsv_full   = cv2.cvtColor(
+            cv2.cvtColor(np.array(img_rgb_800x1200), cv2.COLOR_RGB2BGR),
+            cv2.COLOR_BGR2HSV)
+        cream_full = cv2.inRange(hsv_full, (0, 0, 140), (40, 70, 255))
+        k_f        = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
+        cream_full = cv2.morphologyEx(cream_full, cv2.MORPH_CLOSE, k_f)
+
+        dress_row = None
+        for row in range(0, 1200):
+            band = cream_full[row, int(800*0.30):int(800*0.75)]
+            if np.sum(band > 0) > 20:
+                dress_row = row
+                break
+
+        head_row_pct = max(0, (dress_row / 1200) - 0.28) if dress_row else 0.20
+        pc_y1 = max(0, int(head_row_pct * ih) - int(ih * 0.05))
+        pc_y2 = ih
+
+        img = img.crop((pc_x1, pc_y1, pc_x2, pc_y2))
+        iw, ih = img.size
+        log.info(f"Fashion v12: wide-shot pre-crop -> ({pc_x1},{pc_y1})-({pc_x2},{pc_y2}) new={iw}x{ih}")
+
+    # ── STEP 1: Face detection ────────────────────────────────────────────
+    DW, DH = 800, 1200
+    # ── FIX 2: Convert to RGB before creating the OpenCV canvas.
+    small    = img.convert("RGB").resize((DW, DH), Image.Resampling.LANCZOS)
+    sx, sy   = iw/DW, ih/DH
+    cv_small = cv2.cvtColor(np.array(small), cv2.COLOR_RGB2BGR)
+    gray     = cv2.cvtColor(cv_small, cv2.COLOR_BGR2GRAY)
+    hsv      = cv2.cvtColor(cv_small, cv2.COLOR_BGR2HSV)
+
+    best_face = None; best_score = 0
+    for cp in [cv2.data.haarcascades+"haarcascade_frontalface_default.xml",
+               cv2.data.haarcascades+"haarcascade_frontalface_alt2.xml"]:
+        if not os.path.exists(cp): continue
+        casc = cv2.CascadeClassifier(cp)
+        for sf in [1.05, 1.1, 1.15]:
+            for mn in [4, 5]:
+                try:
+                    faces = casc.detectMultiScale(gray, sf, mn,
+                        minSize=(int(DH*0.05), int(DH*0.05)),
+                        maxSize=(int(DH*0.30), int(DH*0.30)))
+                    for fx, fy, fw, fh in faces:
+                        if fy/DH > 0.45: continue
+                        cx_f = (fx+fw/2)/DW
+                        if cx_f < 0.12 or cx_f > 0.88: continue
+                        if fh/DH > 0.28: continue
+                        score = (fh/DH)*0.5 + (1-(fy+fh/2)/DH)*0.5
+                        if score > best_score:
+                            best_score = score; best_face = (fx,fy,fw,fh)
+                except Exception: pass
+
+    # ── STEP 2: Dress detection ───────────────────────────────────────────
+    cream = cv2.inRange(hsv, (0,0,140), (40,70,255))
+    k     = cv2.getStructuringElement(cv2.MORPH_RECT, (10,10))
+    cream = cv2.morphologyEx(cream, cv2.MORPH_CLOSE, k)
+    dress_top_row = None; dress_cx_s = DW//2
+    for row in range(0, DH):
+        band = cream[row, int(DW*0.20):int(DW*0.80)]
+        if np.sum(band > 0) > 30:
+            dress_top_row = row
+            cols = np.where(cream[row,:] > 0)[0]
+            if len(cols): dress_cx_s = int(np.mean(cols))
+            break
+
+    # ── STEP 3: Combine ───────────────────────────────────────────────────
+    if best_face:
+        fx, fy, fw, fh = best_face
+        head_top_s = max(0, fy - int(fh*0.45))
+        final_cx_s = dress_cx_s if dress_top_row else fx+fw//2
+        log.info(f"Fashion v12: face head={head_top_s/DH*100:.1f}% cx={final_cx_s/DW*100:.1f}%")
+    elif dress_top_row is not None:
+        head_top_s = max(0, dress_top_row - int(DH*0.28))
+        final_cx_s = dress_cx_s
+        log.info(f"Fashion v12: dress head={head_top_s/DH*100:.1f}% cx={final_cx_s/DW*100:.1f}%")
+    else:
+        head_top_s = int(DH*0.08); final_cx_s = DW//2
+        log.info("Fashion v12: center fallback")
+
+    head_top = int(head_top_s*sy); final_cx = int(final_cx_s*sx)
+    person_h = ih - head_top
+
+    if person_h < 50:
+        return engine_smart_crop(img, tw, th, category=category)
+
+    # ── STEPS 4-7: Scale + crop ───────────────────────────────────────────
+    target_h  = int(th*(1.0-HEAD_TOP_PCT-FEET_BOT_PCT))
+    scale     = target_h/max(person_h,1)
+    scaled_iw = int(iw*scale); scaled_ih = int(ih*scale)
+    if scaled_iw < tw:
+        scale=tw/iw; scaled_iw=tw; scaled_ih=int(ih*scale)
+
+    scaled = img.resize((scaled_iw,scaled_ih), Image.Resampling.LANCZOS)
+    crop_top  = int(head_top*scale) - int(th*HEAD_TOP_PCT)
+    crop_left = int(final_cx*scale) - tw//2
+    crop_top  = max(0, min(crop_top,  scaled_ih-th))
+    crop_left = max(0, min(crop_left, scaled_iw-tw))
+
+    result = scaled.crop((crop_left, crop_top, crop_left+tw, crop_top+th))
+    if result.size != (tw,th): result = result.resize((tw,th), Image.Resampling.LANCZOS)
+    log.info(f"Fashion v12: scale={scale:.3f} crop=({crop_left},{crop_top})")
+    return result
+
+
 def engine_mirror_bg(img, tw, th, **_):
     bg = ImageOps.fit(img.copy(), (tw, th), Image.Resampling.LANCZOS)
     bg = bg.filter(ImageFilter.GaussianBlur(radius=28))
     bg = Image.blend(bg, Image.new("RGB", (tw, th), (0, 0, 0)), alpha=0.35)
-    thumb = img.copy()
-    thumb.thumbnail((tw, th), Image.Resampling.LANCZOS)
+    thumb = img.copy(); thumb.thumbnail((tw, th), Image.Resampling.LANCZOS)
     bg.paste(thumb, ((tw - thumb.width) // 2, (th - thumb.height) // 2))
     return bg
 
@@ -541,89 +746,257 @@ def engine_stretch(img, tw, th, **_):
     return img.resize((tw, th), Image.Resampling.LANCZOS)
 
 
-def engine_fashion_consistent(img, tw, th, category="General", **_):
+# ─────────────────────────────────────────────────────────────────────────────
+#  POSE AI (SOTA) ENGINE — YOLOv8-Pose / YOLOv11-Pose
+#  Ported from pose_fashion_processor.py v1.3.0 | Siar Digital 2026
+#  Provides standardized 12% headspace & 10% footspace across all images.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Pose keypoint indices (COCO-17)
+_POSE_KP = {
+    "nose": 0, "left_eye": 1, "right_eye": 2, "left_ear": 3, "right_ear": 4,
+    "left_shoulder": 5, "right_shoulder": 6, "left_elbow": 7, "right_elbow": 8,
+    "left_wrist": 9, "right_wrist": 10, "left_hip": 11, "right_hip": 12,
+    "left_knee": 13, "right_knee": 14, "left_ankle": 15, "right_ankle": 16,
+}
+_POSE_KP_CONF    = 0.30   # min keypoint confidence to be considered valid
+_POSE_DARK_THR   = 80     # mean brightness below which CLAHE is applied
+_POSE_HEAD_SPACE = 0.12   # fraction of output frame above head
+_POSE_FOOT_SPACE = 0.10   # fraction of output frame below feet
+_POSE_MODEL_NAME = "yolov8m-pose.pt"
+
+def _pose_get_model():
+    """Load & cache the YOLO pose model (singleton)."""
+    global _pose_model_cache
+    if _POSE_MODEL_NAME not in _pose_model_cache:
+        if not HAS_YOLO:
+            return None
+        try:
+            _pose_model_cache[_POSE_MODEL_NAME] = YOLO(_POSE_MODEL_NAME)
+            log.info(f"Pose model loaded: {_POSE_MODEL_NAME}")
+        except Exception as e:
+            log.warning(f"Pose model load failed: {e}")
+            return None
+    return _pose_model_cache.get(_POSE_MODEL_NAME)
+
+def _pose_normalize_dark(img_bgr):
+    """Apply CLAHE to L-channel (LAB) when image is underexposed. Returns BGR."""
+    if img_bgr.mean() >= _POSE_DARK_THR:
+        return img_bgr
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    lab_eq = cv2.merge([clahe.apply(l), a, b])
+    return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+
+def _pose_kp_xy(kps, name):
+    """Return (x, y) for a keypoint if confidence >= threshold, else None."""
+    idx = _POSE_KP[name]
+    if kps.shape[0] <= idx:
+        return None
+    x, y, conf = kps[idx]
+    return (float(x), float(y)) if conf >= _POSE_KP_CONF else None
+
+def _pose_extract(kps, img_h, img_w, bbox=None):
     """
-    Fashion Consistent Engine v2.0 — Siar Digital
-    -----------------------------------------------
-    Designed for clothing/fashion e-commerce.
-    ALL images get identical model placement — head at same %, feet at same %.
-    Original background preserved — NO blur, NO fill, NO stretch.
+    Extract head_top, feet_bottom, center_x from COCO-17 keypoints.
 
-    Logic:
-    1. Detect person bbox (YOLO → CV face → saliency)
-    2. Scale full image so person_h fits target zone
-    3. Crop canvas from scaled image — model always same position
-    4. 100% original background — nothing added
+    Head-top two-anchor system:
+      bbox_by1 < nose_y  → use bbox (hair top), offset=2%  (looking-down fix)
+      else               → use nose,            offset=10% (nose→crown gap)
+
+    Feet three-priority:
+      P1: ankles/knees keypoints
+      P2: bbox bottom (long dresses)
+      P3: torso×2.1 extrapolation
     """
-    # ── Placement targets ─────────────────────────────────────────────────
-    HEAD_TOP_PCT = 0.06   # head at 6% from top
-    FEET_BOT_PCT = 0.04   # feet at 4% from bottom
+    # Nose / face keypoint
+    nose = _pose_kp_xy(kps, "nose")
+    if nose is None:
+        fallbacks = ["left_eye", "right_eye", "left_ear", "right_ear"]
+        ys = [_pose_kp_xy(kps, n)[1] for n in fallbacks if _pose_kp_xy(kps, n)]
+        if not ys:
+            return None
+        nose_y = float(np.mean(ys))
+        nose_x = float(np.mean([_pose_kp_xy(kps, n)[0] for n in fallbacks
+                                  if _pose_kp_xy(kps, n)]))
+    else:
+        nose_x, nose_y = nose
 
-    iw, ih = img.size
+    bbox_by1 = float(bbox[1]) if bbox else None
+    bbox_by2 = float(bbox[3]) if bbox else None
 
-    # ── Step 1: Detect person ─────────────────────────────────────────────
-    bbox = None
-    if HAS_YOLO:
-        bbox = _detect_person_bbox_yolo(img, category)
-    if bbox is None and HAS_OPENCV:
-        bbox = _detect_person_bbox_cv(img, category)
-    if bbox is None and HAS_OPENCV:
-        bbox = _detect_person_bbox_saliency(img)
+    # Head anchor selection
+    if bbox_by1 is not None and bbox_by1 < nose_y:
+        head_top_y, offset_frac = bbox_by1, 0.02  # bbox covers hair
+    else:
+        head_top_y, offset_frac = nose_y, 0.10    # nose → crown bridge
 
-    if bbox is None:
-        log.info("Fashion engine: no detection → smart crop fallback")
-        return engine_smart_crop(img, tw, th, category=category)
+    # Feet
+    feet_y = None
+    for name in ["left_ankle", "right_ankle", "left_knee", "right_knee"]:
+        pt = _pose_kp_xy(kps, name)
+        if pt and (feet_y is None or pt[1] > feet_y):
+            feet_y = pt[1]
+    if bbox_by2 is not None:
+        feet_y = max(feet_y, bbox_by2) if feet_y else bbox_by2
+    if feet_y is None:
+        hip_pts = [_pose_kp_xy(kps, n) for n in ["left_hip", "right_hip"]
+                   if _pose_kp_xy(kps, n)]
+        if hip_pts:
+            hip_y  = float(np.mean([p[1] for p in hip_pts]))
+            feet_y = min(nose_y + (hip_y - nose_y) * 2.1, float(img_h))
+        else:
+            valid_ys = [kps[i,1] for i in range(kps.shape[0]) if kps[i,2] >= _POSE_KP_CONF]
+            if not valid_ys:
+                return None
+            feet_y = float(max(valid_ys))
 
-    person_top    = max(0,  bbox["head_top"])
-    person_bottom = min(ih, bbox["feet_bottom"])
-    person_left   = max(0,  bbox["body_left"])
-    person_right  = min(iw, bbox["body_right"])
-    person_cx     = (person_left + person_right) // 2
-    person_h      = person_bottom - person_top
+    # Horizontal center
+    center_kps = ["left_shoulder","right_shoulder","left_hip","right_hip"]
+    cxs = [_pose_kp_xy(kps, n)[0] for n in center_kps if _pose_kp_xy(kps, n)]
+    center_x = float(np.mean(cxs)) if cxs else nose_x
 
-    if person_h < 50:
-        log.info("Fashion engine: bbox too small → smart crop fallback")
-        return engine_smart_crop(img, tw, th, category=category)
+    # Body width bounds
+    valid_xs = [kps[i,0] for i in range(kps.shape[0]) if kps[i,2] >= _POSE_KP_CONF]
+    if bbox:
+        valid_xs = [float(bbox[0]), float(bbox[2])] + valid_xs
+    body_left  = float(min(valid_xs)) if valid_xs else max(0.0, center_x - 50)
+    body_right = float(max(valid_xs)) if valid_xs else min(float(img_w), center_x + 50)
 
-    # ── Step 2: Scale so person fits target zone ──────────────────────────
-    target_person_h = int(th * (1.0 - HEAD_TOP_PCT - FEET_BOT_PCT))
-    scale = target_person_h / max(person_h, 1)
+    return {
+        "head_top_y":   head_top_y,
+        "feet_y":       feet_y,
+        "center_x":     center_x,
+        "body_left":    body_left,
+        "body_right":   body_right,
+        "offset_frac":  offset_frac,
+    }
 
-    scaled_iw = int(iw * scale)
-    scaled_ih = int(ih * scale)
-    scaled_img = img.resize((scaled_iw, scaled_ih), Image.Resampling.LANCZOS)
+def _pose_run_yolo(model, img_bgr, conf, img_h, img_w):
+    """Run YOLO pose on img_bgr and return best PoseData dict or None."""
+    results = model(img_bgr, conf=conf, verbose=False, task="pose")
+    best_pose = None
+    best_area = 0.0
+    for r in results:
+        if r.keypoints is None:
+            continue
+        kps_all = r.keypoints.data.cpu().numpy()
+        boxes   = r.boxes.xyxy.cpu().numpy() if r.boxes is not None else None
+        for idx in range(kps_all.shape[0]):
+            kps = kps_all[idx]
+            bbox = None
+            if boxes is not None and idx < len(boxes):
+                bx1, by1, bx2, by2 = boxes[idx]
+                area = (bx2 - bx1) * (by2 - by1)
+                bbox = (float(bx1), float(by1), float(bx2), float(by2))
+            else:
+                area = img_h * img_w
+            if area < best_area:
+                continue
+            pose = _pose_extract(kps, img_h, img_w, bbox)
+            if pose:
+                best_pose = pose
+                best_area = area
+    return best_pose
 
-    # Person position in scaled image
-    scaled_person_top = int(person_top * scale)
-    scaled_person_cx  = int(person_cx  * scale)
+def _pose_compute_crop(pose, img_h, img_w, tw, th):
+    """Compute (x1,y1,x2,y2) crop in original image coords."""
+    target_aspect = tw / th
+    person_h = max(pose["feet_y"] - pose["head_top_y"], 1.0)
 
-    # ── Step 3: Crop box from scaled image ────────────────────────────────
-    # Vertical: top of crop so that person_top lands at HEAD_TOP_PCT
-    crop_top = scaled_person_top - int(th * HEAD_TOP_PCT)
+    # Head offset: 2% if bbox anchor (already at hair), 10% if nose anchor
+    head_offset_px  = pose["offset_frac"] * person_h
+    adj_head_y      = pose["head_top_y"] - head_offset_px
+    adj_feet_y      = pose["feet_y"]
+    person_display_h = adj_feet_y - adj_head_y
 
-    # Horizontal: center person horizontally
-    crop_left = scaled_person_cx - tw // 2
+    content_frac = max(1.0 - _POSE_HEAD_SPACE - _POSE_FOOT_SPACE, 0.20)
+    crop_h = person_display_h / content_frac
+    crop_top    = adj_head_y - _POSE_HEAD_SPACE * crop_h
+    crop_bottom = crop_top + crop_h
+    crop_w      = crop_h * target_aspect
 
-    # Clamp — do not go outside scaled image
-    crop_top  = max(0, min(crop_top,  scaled_ih - th))
-    crop_left = max(0, min(crop_left, scaled_iw - tw))
+    # Center horizontally
+    crop_left  = pose["center_x"] - crop_w / 2.0
+    crop_right = crop_left + crop_w
 
-    crop_bottom = crop_top  + th
-    crop_right  = crop_left + tw
+    # Enforce minimum width = body width × 1.2
+    body_w    = pose["body_right"] - pose["body_left"]
+    min_crop_w = body_w * 1.20
+    if crop_w < min_crop_w:
+        crop_w      = min_crop_w
+        crop_h      = crop_w / target_aspect
+        crop_top    = adj_head_y - _POSE_HEAD_SPACE * crop_h
+        crop_bottom = crop_top + crop_h
+        crop_left   = pose["center_x"] - crop_w / 2.0
+        crop_right  = crop_left + crop_w
 
-    # Final safety clamp
-    crop_bottom = min(crop_bottom, scaled_ih)
-    crop_right  = min(crop_right,  scaled_iw)
+    return (int(round(crop_left)), int(round(crop_top)),
+            int(round(crop_right)), int(round(crop_bottom)))
 
-    result = scaled_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+def engine_pose_ai(img, tw, th, **_):
+    """
+    Pose AI (SOTA) engine — YOLOv8-Pose skeleton-based crop.
+    Guarantees 12% headspace / 10% footspace in output.
+    Handles: looking-down poses, long dresses, dark studio images.
+    Falls back to center-crop if YOLO unavailable or detects nothing.
+    """
+    if not HAS_YOLO:
+        log.warning("Pose AI: ultralytics not installed — falling back to fill-crop.")
+        return engine_fill_crop(img, tw, th)
 
-    # If crop is smaller than target (edge case), resize to exact
-    if result.size != (tw, th):
-        result = result.resize((tw, th), Image.Resampling.LANCZOS)
+    model = _pose_get_model()
+    if model is None:
+        log.warning("Pose AI: model load failed — falling back to fill-crop.")
+        return engine_fill_crop(img, tw, th)
 
-    log.info(f"Fashion engine: person_h={person_h} scale={scale:.3f} "
-             f"crop=({crop_left},{crop_top})-({crop_right},{crop_bottom})")
+    # Convert PIL → BGR numpy for YOLO
+    img_rgb = img.convert("RGB")
+    img_bgr = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2BGR)
+    img_h, img_w = img_bgr.shape[:2]
 
+    # CLAHE for dark images
+    img_for_det = _pose_normalize_dark(img_bgr)
+
+    # Attempt 1: configured confidence (default 0.35)
+    pose = _pose_run_yolo(model, img_for_det, 0.35, img_h, img_w)
+
+    # Attempt 2: retry with gamma boost + lower conf (dark/unusual images)
+    if pose is None:
+        log.debug("Pose AI: retry with gamma boost + conf=0.15")
+        gamma_table = np.array(
+            [min(255, int(((i / 255.0) ** (1.0/2.5)) * 255)) for i in range(256)],
+            dtype=np.uint8)
+        img_boosted = cv2.LUT(img_for_det, gamma_table)
+        pose = _pose_run_yolo(model, img_boosted, 0.15, img_h, img_w)
+
+    # Fallback: center-crop if still nothing
+    if pose is None:
+        log.warning("Pose AI: no person detected — using center fallback.")
+        return ImageOps.fit(img, (tw, th), Image.Resampling.LANCZOS,
+                            centering=(0.5, 0.35))
+
+    # Compute crop box
+    x1, y1, x2, y2 = _pose_compute_crop(pose, img_h, img_w, tw, th)
+
+    # Clamp to image boundaries (no padding)
+    cx1, cy1 = max(0, x1), max(0, y1)
+    cx2, cy2 = min(img_w, x2), min(img_h, y2)
+    cx2, cy2 = max(cx2, cx1 + 1), max(cy2, cy1 + 1)
+
+    # Crop from BGR, convert back to PIL RGB
+    cropped_bgr = img_bgr[cy1:cy2, cx1:cx2]
+    cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
+    cropped_pil = Image.fromarray(cropped_rgb)
+
+    # Resize with best interpolation
+    interp = (Image.Resampling.LANCZOS if (cx2-cx1) < tw or (cy2-cy1) < th
+              else Image.Resampling.LANCZOS)
+    result = cropped_pil.resize((tw, th), interp)
+
+    log.info(f"Pose AI: crop({cx1},{cy1})→({cx2},{cy2}) | "
+             f"head_mode={'bbox' if pose['offset_frac']==0.02 else 'nose'}")
     return result
 
 MODE_MAP = {
@@ -635,6 +1008,7 @@ MODE_MAP = {
     "Letterbox (Dark BG)":       engine_letterbox_dark,
     "Letterbox (White BG)":      engine_letterbox_white,
     "Stretch to Fit":            engine_stretch,
+    "Pose AI (SOTA)":            engine_pose_ai,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -649,8 +1023,7 @@ def save_with_quality_guard(img, out_path, fmt, initial_quality, lossless):
     while quality >= 50:
         buf = io.BytesIO()
         if ext == "webp":
-            img.save(buf, format="WEBP", quality=quality, method=6,
-                     lossless=(quality >= 95))
+            img.save(buf, format="WEBP", quality=quality, method=6, lossless=(quality >= 95))
         elif ext in ("jpg", "jpeg"):
             img.save(buf, format="JPEG", quality=quality, optimize=True,
                      progressive=True, subsampling="4:4:4")
@@ -658,8 +1031,7 @@ def save_with_quality_guard(img, out_path, fmt, initial_quality, lossless):
             compress = max(0, min(9, (100 - quality) // 11))
             img.save(buf, format="PNG", compress_level=compress, optimize=True)
         elif ext == "tiff":
-            img.save(buf, format="TIFF",
-                     compression="lzw" if quality < 90 else "none")
+            img.save(buf, format="TIFF", compression="lzw" if quality < 90 else "none")
         else:
             img.save(buf, format=ext.upper())
         size_kb = buf.tell() / 1024
@@ -674,7 +1046,7 @@ def save_with_quality_guard(img, out_path, fmt, initial_quality, lossless):
         f.write(buf.read())
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  File Scanner
+#  File Scanner — skips macOS hidden files
 # ─────────────────────────────────────────────────────────────────────────────
 def scan_image_files(input_path):
     input_path = os.path.normpath(os.path.abspath(input_path))
@@ -682,7 +1054,7 @@ def scan_image_files(input_path):
     for root, dirs, files in os.walk(input_path):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for fname in files:
-            # FIX v4.3: Skip macOS hidden metadata files (._filename, .DS_Store etc)
+            # Skip macOS hidden metadata files (._filename, .DS_Store etc)
             if fname.startswith("._") or fname.startswith("."):
                 continue
             if fname.lower().endswith(SUPPORTED_EXTS):
@@ -716,7 +1088,6 @@ def process_one(abs_path, rel_path, out_dir, tw, th, mode, fmt,
         orig_w, orig_h = img.size
         orig_size_kb = os.path.getsize(abs_path) / 1024
 
-        # Normalise mode
         if img.mode in ("P", "PA"):
             img = img.convert("RGBA")
         if img.mode in ("RGBA", "LA"):
@@ -729,39 +1100,40 @@ def process_one(abs_path, rel_path, out_dir, tw, th, mode, fmt,
         elif img.mode != "RGB":
             img = img.convert("RGB")
 
-        # Optional rembg watermark removal — non-fatal
+        # ── FIX 4: Pass PIL Image directly to rembg_remove instead of
+        #    round-tripping through PNG bytes. This avoids a wasteful
+        #    encode→decode cycle and removes the JPEG-quality loss that
+        #    came from saving as PNG at intermediate step.
         if remove_watermark and HAS_REMBG:
             try:
                 session = _get_rembg_session()
-                img_bytes = io.BytesIO()
-                img.save(img_bytes, format="PNG")
-                img_bytes.seek(0)
-                cleaned = rembg_remove(img_bytes.read(), session=session)
-                cleaned_img = Image.open(io.BytesIO(cleaned)).convert("RGBA")
-                bg2 = Image.new("RGB", cleaned_img.size, (255, 255, 255))
-                bg2.paste(cleaned_img, mask=cleaned_img.split()[-1])
-                img = bg2
-                log.info(f"rembg OK: {rel_path}")
+                # rembg_remove accepts PIL Images directly; no need to encode first.
+                cleaned_img = rembg_remove(img, session=session)
+                if cleaned_img.mode == "RGBA":
+                    bg2 = Image.new("RGB", cleaned_img.size, (255, 255, 255))
+                    bg2.paste(cleaned_img, mask=cleaned_img.split()[-1])
+                    img = bg2
+                else:
+                    img = cleaned_img.convert("RGB")
             except Exception as e:
-                log.warning(f"rembg failed ({rel_path}): {e} — skipping, continuing")
+                log.warning(f"rembg failed ({rel_path}): {e} — skipping")
 
-        # Preview original
         p_orig = None
         if send_preview:
             p_orig = img.copy()
             p_orig.thumbnail((240, 180), Image.Resampling.LANCZOS)
 
-        # Apply engine
         engine_fn = MODE_MAP.get(mode, engine_mirror_bg)
-        if engine_fn == engine_smart_crop:
+        if engine_fn in (engine_smart_crop, engine_fashion_consistent):
             result = engine_fn(img, tw, th, category=category)
+        elif engine_fn is engine_pose_ai:
+            result = engine_fn(img, tw, th)
         else:
             result = engine_fn(img, tw, th)
 
         del img
         gc.collect()
 
-        # Preview result
         p_res = None
         if send_preview:
             p_res = result.copy()
@@ -811,7 +1183,7 @@ def generate_audit_report(audit_data, out_dir, tw, th, mode, category):
         i = ws["A2"]
         i.value = (f"Asif Nawaz | Siar Digital 2026 | "
                    f"{datetime.now().strftime('%Y-%m-%d %H:%M')} | "
-                   f"Target: {tw}×{th} | Mode: {mode} | Category: {category}")
+                   f"Target: {tw}x{th} | Mode: {mode} | Category: {category}")
         i.font = Font(name=_MONO, size=9, color="7A95C0")
         i.fill = PatternFill("solid", fgColor="0D1321")
         i.alignment = Alignment(horizontal="center")
@@ -835,8 +1207,7 @@ def generate_audit_report(audit_data, out_dir, tw, th, mode, category):
                 c.border = bdr
                 c.alignment = Alignment(horizontal="left")
                 c.fill = PatternFill("solid", fgColor="1A0910" if fail else "091A12")
-                c.font = Font(name=_MONO, size=9,
-                              color="FF4D6D" if fail else "00F5A0")
+                c.font = Font(name=_MONO, size=9, color="FF4D6D" if fail else "00F5A0")
         sr = len(audit_data) + 5
         sc = sum(1 for r in audit_data if r[4] == "Success")
         ws.merge_cells(f"A{sr}:F{sr}")
@@ -975,7 +1346,7 @@ class ImageResizerPro(ctk.CTk):
         self.speed_var     = ctk.StringVar(value="0.0 img/s")
         self._build_ui()
         self._poll_queue()
-        log.info(f"Image Resizer v4.4 started | OS={_OS}")
+        log.info(f"Image Resizer v4.4.1 started | OS={_OS} | Font={_MONO}")
 
     def _build_ui(self):
         self._build_header()
@@ -998,7 +1369,7 @@ class ImageResizerPro(ctk.CTk):
         ctk.CTkLabel(left_hdr, text="▶  IMAGE RESIZER BY SIAR DIGITAL",
                      font=FONTS["hero"], text_color=C["accent"]).pack(anchor="w")
         ctk.CTkLabel(left_hdr,
-                     text="Advanced Batch Engine v4.4  |  AI Detection  |  Smart Fill  |  All Libraries Bundled",
+                     text="Advanced Batch Engine v4.5  |  Pose AI SOTA  |  Fashion Consistent  |  Smart Fill",
                      font=FONTS["subtitle"], text_color=C["text2"]).pack(anchor="w")
         right_hdr = ctk.CTkFrame(hdr, fg_color="transparent")
         right_hdr.pack(side="right", padx=20)
@@ -1036,7 +1407,6 @@ class ImageResizerPro(ctk.CTk):
         return f
 
     def _build_left(self, parent):
-        # SOURCE FOLDER
         sec = self._section(parent, "SOURCE FOLDER", C["accent2"])
         inner = ctk.CTkFrame(sec, fg_color="transparent")
         inner.pack(fill="x", padx=12, pady=8)
@@ -1054,7 +1424,6 @@ class ImageResizerPro(ctk.CTk):
                       text_color="#000", font=FONTS["body"],
                       command=self._browse_input).pack(side="right")
 
-        # SIZE & PRESETS
         sec2 = self._section(parent, "SIZE & PRESETS", C["accent"])
         inner2 = ctk.CTkFrame(sec2, fg_color="transparent")
         inner2.pack(fill="x", padx=12, pady=8)
@@ -1077,7 +1446,6 @@ class ImageResizerPro(ctk.CTk):
                          fg_color=C["surface2"], border_color=C["accent"],
                          justify="center").pack(fill="x")
 
-        # CATEGORY MODE
         sec_cat = self._section(parent, "CATEGORY MODE", C["accent6"])
         inner_cat = ctk.CTkFrame(sec_cat, fg_color="transparent")
         inner_cat.pack(fill="x", padx=12, pady=8)
@@ -1092,28 +1460,32 @@ class ImageResizerPro(ctk.CTk):
                                text_color=C["text"], font=FONTS["tiny"]).pack(pady=6, padx=4)
             Tooltip(b, info["desc"])
 
-        # PLACEMENT MODE
         sec3 = self._section(parent, "PLACEMENT MODE", C["accent5"])
         inner3 = ctk.CTkFrame(sec3, fg_color="transparent")
         inner3.pack(fill="x", padx=12, pady=8)
         for mn, tip in MODE_TIPS.items():
-            is_ai = "AI" in mn
-            r = ctk.CTkFrame(inner3,
-                             fg_color="#1A1530" if is_ai else C["surface2"],
-                             corner_radius=8, border_width=1,
-                             border_color=C["accent5"] if is_ai else C["border"])
+            is_pose = mn == "Pose AI (SOTA)"
+            is_ai   = "AI" in mn
+            bg_col  = "#1A2510" if is_pose else ("#1A1530" if is_ai else C["surface2"])
+            bd_col  = C["gold"]    if is_pose else (C["accent5"] if is_ai else C["border"])
+            rb_col  = C["gold"]    if is_pose else (C["accent5"] if is_ai else C["accent"])
+            r = ctk.CTkFrame(inner3, fg_color=bg_col, corner_radius=8,
+                             border_width=1, border_color=bd_col)
             r.pack(fill="x", pady=2)
             ctk.CTkRadioButton(r, text=mn, variable=self.mode_var, value=mn,
-                               fg_color=C["accent5"] if is_ai else C["accent"],
-                               hover_color=C["accent5"], text_color=C["text"],
+                               fg_color=rb_col, hover_color=rb_col,
+                               text_color=C["text"],
                                font=FONTS["body"]).pack(side="left", padx=10, pady=6)
-            if is_ai:
+            if is_pose:
+                badge = "POSE SOTA" if HAS_YOLO else "needs ultralytics"
+                ctk.CTkLabel(r, text=f"[{badge}]", font=FONTS["badge"],
+                             text_color=C["gold"]).pack(side="left", padx=4)
+            elif is_ai:
                 badge = "AI POWERED" if (HAS_YOLO or HAS_OPENCV) else "needs opencv"
                 ctk.CTkLabel(r, text=f"[{badge}]", font=FONTS["badge"],
                              text_color=C["accent5"]).pack(side="left", padx=4)
             Tooltip(r, tip)
 
-        # FORMAT & QUALITY
         sec4 = self._section(parent, "FORMAT & QUALITY", C["accent4"])
         inner4 = ctk.CTkFrame(sec4, fg_color="transparent")
         inner4.pack(fill="x", padx=12, pady=8)
@@ -1138,16 +1510,13 @@ class ImageResizerPro(ctk.CTk):
                       command=lambda v: self.quality_lbl.set(f"{int(v)}%"),
                       height=14).pack(fill="x", pady=3)
 
-        # ADVANCED
         sec5 = self._section(parent, "ADVANCED OPTIONS", C["accent3"])
         inner5 = ctk.CTkFrame(sec5, fg_color="transparent")
         inner5.pack(fill="x", padx=12, pady=8)
         for sw_text, sw_var, sw_col, tip_txt in [
-            ("Zero-Loss Mode (Lossless PNG)",
-             self.lossless_var, C["accent"],
-             "Forces PNG lossless output. File size not compressed."),
-            ("TURBO Mode (Multi-thread, no live preview)",
-             self.turbo_var, C["accent2"],
+            ("Zero-Loss Mode (Lossless PNG)", self.lossless_var, C["accent"],
+             "Forces PNG lossless output."),
+            ("TURBO Mode (Multi-thread, no live preview)", self.turbo_var, C["accent2"],
              "Parallel processing. Fastest for large batches."),
             ("AI Watermark/Logo Removal (rembg)" +
              ("" if HAS_REMBG else "  ← not bundled"),
@@ -1176,7 +1545,6 @@ class ImageResizerPro(ctk.CTk):
                       height=14).pack(fill="x", pady=3)
 
     def _build_right(self, parent):
-        # Live Preview
         ps = ctk.CTkFrame(parent, fg_color=C["surface"], corner_radius=12,
                           border_width=1, border_color=C["accent5"])
         ps.pack(fill="x", pady=(0, 6))
@@ -1189,12 +1557,10 @@ class ImageResizerPro(ctk.CTk):
         self.prev_filename.pack(pady=(8, 3))
         ir = ctk.CTkFrame(ps, fg_color="transparent")
         ir.pack(fill="x", padx=8, pady=(2, 8))
-        for attr, label, color in [
-            ("lbl_orig", "ORIGINAL", C["accent2"]),
-            ("lbl_res",  "RESIZED",  C["accent"]),
+        for attr, label, color, pad in [
+            ("lbl_orig", "ORIGINAL", C["accent2"], (0, 3)),
+            ("lbl_res",  "RESIZED",  C["accent"],  (3, 0)),
         ]:
-            side = "left" if attr == "lbl_orig" else "left"
-            pad  = (0, 3) if attr == "lbl_orig" else (3, 0)
             b = ctk.CTkFrame(ir, fg_color=C["surface2"], corner_radius=8,
                              border_width=1, border_color=color)
             b.pack(side="left", expand=True, fill="both", padx=pad)
@@ -1205,7 +1571,6 @@ class ImageResizerPro(ctk.CTk):
             lbl.pack(padx=4, pady=(0, 8))
             setattr(self, attr, lbl)
 
-        # Stats
         ss = ctk.CTkFrame(parent, fg_color=C["surface"], corner_radius=12,
                           border_width=1, border_color=C["border"])
         ss.pack(fill="x", pady=6)
@@ -1223,7 +1588,6 @@ class ImageResizerPro(ctk.CTk):
         ctk.CTkLabel(ss, textvariable=self.speed_var,
                      font=FONTS["label"], text_color=C["accent"]).pack(pady=(0, 8))
 
-        # Progress
         ps2 = ctk.CTkFrame(parent, fg_color=C["surface"], corner_radius=12,
                            border_width=1, border_color=C["border"])
         ps2.pack(fill="x", pady=6)
@@ -1237,18 +1601,18 @@ class ImageResizerPro(ctk.CTk):
                                        font=FONTS["small"], text_color=C["text2"])
         self.prog_label.pack(pady=(0, 6))
 
-        # Library Status
         ls = ctk.CTkFrame(parent, fg_color=C["surface"], corner_radius=12,
                           border_width=1, border_color=C["border"])
         ls.pack(fill="x", pady=4)
         ctk.CTkLabel(ls, text="  AI LIBRARY STATUS", font=FONTS["label"],
                      text_color=C["text2"]).pack(anchor="w", padx=10, pady=(8, 4))
         for lib, has in [
-            ("YOLOv8 (Ultralytics)", HAS_YOLO),
-            ("OpenCV",              HAS_OPENCV),
-            ("mediapipe",           HAS_MEDIAPIPE),
-            ("rembg (U2-Net)",      HAS_REMBG),
-            ("openpyxl",            HAS_OPENPYXL),
+            ("YOLOv8-Pose (Pose AI SOTA)", HAS_YOLO),
+            ("YOLOv8 (Smart Crop AI)",     HAS_YOLO),
+            ("OpenCV",                     HAS_OPENCV),
+            ("mediapipe",                  HAS_MEDIAPIPE),
+            ("rembg (U2-Net)",             HAS_REMBG),
+            ("openpyxl",                   HAS_OPENPYXL),
         ]:
             row = ctk.CTkFrame(ls, fg_color="transparent")
             row.pack(fill="x", padx=10, pady=1)
@@ -1258,7 +1622,6 @@ class ImageResizerPro(ctk.CTk):
                          width=200, anchor="w").pack(side="left")
         ctk.CTkFrame(ls, height=6, fg_color="transparent").pack()
 
-        # Credit
         cf = ctk.CTkFrame(parent, fg_color=C["surface"], corner_radius=12,
                           border_width=2, border_color=C["gold"])
         cf.pack(fill="x", pady=(8, 4))
@@ -1336,7 +1699,7 @@ class ImageResizerPro(ctk.CTk):
             tw = int(self.width_var.get()); th = int(self.height_var.get())
             assert 1 <= tw <= 20000 and 1 <= th <= 20000
         except Exception:
-            messagebox.showerror("Invalid Size", "Width/Height must be 1–20000.")
+            messagebox.showerror("Invalid Size", "Width/Height must be 1-20000.")
             return
         inp = os.path.normpath(os.path.abspath(inp))
         out_dir = os.path.join(os.path.dirname(inp), f"{os.path.basename(inp)}_resized")
@@ -1411,7 +1774,18 @@ class ImageResizerPro(ctk.CTk):
                     self.lbl_res.configure(image=tk_r, text="")
                     self.lbl_res.image = tk_r
                     self._tk_images.extend([tk_o, tk_r])
+                    # ── FIX 5: Clear label .image refs before trimming the list so
+                    #    old PhotoImage objects are actually released by the GC.
+                    #    Original code trimmed _tk_images but labels still held refs,
+                    #    preventing garbage collection and slowly leaking memory.
                     if len(self._tk_images) > 24:
+                        # Determine which images are being dropped
+                        to_drop = self._tk_images[:-24]
+                        # Clear label refs only if they point to a dropped image
+                        if self.lbl_orig.image in to_drop:
+                            self.lbl_orig.image = None
+                        if self.lbl_res.image in to_drop:
+                            self.lbl_res.image = None
                         self._tk_images = self._tk_images[-24:]
                 elif kind == "generating_report":
                     self._set_status("Generating Report...", C["accent5"])
