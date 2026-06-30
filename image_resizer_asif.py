@@ -691,6 +691,23 @@ def engine_fashion_consistent(img, tw, th, category="General", **_):
     if scaled_iw < tw:
         scale=tw/iw; scaled_iw=tw; scaled_ih=int(ih*scale)
 
+    # ── Headspace guard ───────────────────────────────────────────────────
+    # Problem: when head_top is far down in the original image (model in
+    # lower half of photo), crop_top goes negative → clamps to 0 →
+    # actual output headspace becomes much larger than HEAD_TOP_PCT.
+    # Fix: if crop_top would clamp to 0, increase scale so that
+    # head_top lands exactly at HEAD_TOP_PCT from the top of output frame.
+    raw_crop_top = int(head_top * scale) - int(th * HEAD_TOP_PCT)
+    if raw_crop_top < 0 and head_top > 0:
+        # Scale so: head_top * new_scale = HEAD_TOP_PCT * th
+        scale_for_head = (HEAD_TOP_PCT * th) / max(head_top, 1)
+        scale_for_body = target_h / max(person_h, 1)
+        scale     = max(scale_for_head, scale_for_body)
+        scaled_iw = int(iw * scale); scaled_ih = int(ih * scale)
+        if scaled_iw < tw:
+            scale = tw/iw; scaled_iw = tw; scaled_ih = int(ih * scale)
+        log.info(f"Fashion v12: headspace guard → new scale={scale:.3f}")
+
     scaled = img.resize((scaled_iw,scaled_ih), Image.Resampling.LANCZOS)
     crop_top  = int(head_top*scale) - int(th*HEAD_TOP_PCT)
     crop_left = int(final_cx*scale) - tw//2
@@ -937,66 +954,60 @@ def _pose_compute_crop(pose, img_h, img_w, tw, th):
 
 def engine_pose_ai(img, tw, th, **_):
     """
-    Pose AI (SOTA) engine — YOLOv8-Pose skeleton-based crop.
-    Guarantees 12% headspace / 10% footspace in output.
-    Handles: looking-down poses, long dresses, dark studio images.
-    Falls back to center-crop if YOLO unavailable or detects nothing.
+    Pose AI (SOTA) engine — yolov8m-pose ONLY.
+    Uses ONLY YOLOv8m-Pose skeleton detection.
+    NO CV face detection, NO saliency, NO other libraries.
+    Clean pipeline: YOLO → keypoints → crop → resize.
     """
     if not HAS_YOLO:
-        log.warning("Pose AI: ultralytics not installed — falling back to fill-crop.")
+        log.warning("Pose AI: ultralytics not installed — pip install ultralytics")
         return engine_fill_crop(img, tw, th)
 
     model = _pose_get_model()
     if model is None:
-        log.warning("Pose AI: model load failed — falling back to fill-crop.")
+        log.warning("Pose AI: yolov8m-pose.pt load failed")
         return engine_fill_crop(img, tw, th)
 
-    # Convert PIL → BGR numpy for YOLO
-    img_rgb = img.convert("RGB")
-    img_bgr = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2BGR)
+    # ── Convert PIL → BGR ─────────────────────────────────────────────────
+    img_bgr = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
     img_h, img_w = img_bgr.shape[:2]
 
-    # CLAHE for dark images
+    # ── CLAHE for dark/moody images ───────────────────────────────────────
     img_for_det = _pose_normalize_dark(img_bgr)
 
-    # Attempt 1: configured confidence (default 0.35)
+    # ── Attempt 1: conf=0.35 ─────────────────────────────────────────────
     pose = _pose_run_yolo(model, img_for_det, 0.35, img_h, img_w)
 
-    # Attempt 2: retry with gamma boost + lower conf (dark/unusual images)
+    # ── Attempt 2: gamma boost + conf=0.15 ───────────────────────────────
     if pose is None:
         log.debug("Pose AI: retry with gamma boost + conf=0.15")
         gamma_table = np.array(
-            [min(255, int(((i / 255.0) ** (1.0/2.5)) * 255)) for i in range(256)],
+            [min(255, int(((i/255.0)**(1.0/2.5))*255)) for i in range(256)],
             dtype=np.uint8)
-        img_boosted = cv2.LUT(img_for_det, gamma_table)
-        pose = _pose_run_yolo(model, img_boosted, 0.15, img_h, img_w)
+        pose = _pose_run_yolo(model, cv2.LUT(img_for_det, gamma_table),
+                              0.15, img_h, img_w)
 
-    # Fallback: center-crop if still nothing
+    # ── No detection → center fallback ───────────────────────────────────
     if pose is None:
-        log.warning("Pose AI: no person detected — using center fallback.")
+        log.warning("Pose AI: no person detected — center fallback")
         return ImageOps.fit(img, (tw, th), Image.Resampling.LANCZOS,
                             centering=(0.5, 0.35))
 
-    # Compute crop box
+    # ── Crop box from skeleton ────────────────────────────────────────────
     x1, y1, x2, y2 = _pose_compute_crop(pose, img_h, img_w, tw, th)
 
-    # Clamp to image boundaries (no padding)
-    cx1, cy1 = max(0, x1), max(0, y1)
-    cx2, cy2 = min(img_w, x2), min(img_h, y2)
-    cx2, cy2 = max(cx2, cx1 + 1), max(cy2, cy1 + 1)
+    # ── Clamp to image boundaries ─────────────────────────────────────────
+    cx1 = max(0,     x1);  cy1 = max(0,     y1)
+    cx2 = min(img_w, x2);  cy2 = min(img_h, y2)
+    cx2 = max(cx2, cx1+1); cy2 = max(cy2, cy1+1)
 
-    # Crop from BGR, convert back to PIL RGB
-    cropped_bgr = img_bgr[cy1:cy2, cx1:cx2]
-    cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
-    cropped_pil = Image.fromarray(cropped_rgb)
+    # ── Crop → PIL → resize ───────────────────────────────────────────────
+    cropped = Image.fromarray(
+        cv2.cvtColor(img_bgr[cy1:cy2, cx1:cx2], cv2.COLOR_BGR2RGB))
+    result = cropped.resize((tw, th), Image.Resampling.LANCZOS)
 
-    # Resize with best interpolation
-    interp = (Image.Resampling.LANCZOS if (cx2-cx1) < tw or (cy2-cy1) < th
-              else Image.Resampling.LANCZOS)
-    result = cropped_pil.resize((tw, th), interp)
-
-    log.info(f"Pose AI: crop({cx1},{cy1})→({cx2},{cy2}) | "
-             f"head_mode={'bbox' if pose['offset_frac']==0.02 else 'nose'}")
+    log.info(f"Pose AI: crop({cx1},{cy1})→({cx2},{cy2}) "
+             f"anchor={'bbox' if pose['offset_frac']==0.02 else 'nose'}")
     return result
 
 MODE_MAP = {
