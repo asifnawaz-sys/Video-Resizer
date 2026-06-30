@@ -341,6 +341,13 @@ def _estimate_body_from_face(face, sv_w, sv_h):
     }
 
 def _detect_person_bbox_cv(img_pil, category):
+    """
+    Full human-eye pipeline:
+    1. Resize to calibrated canvas using _resize_for_detection (consistent helper)
+    2. Face detection (multi-cascade, multi-param)
+    3. GrabCut seeded from face -> body extent
+    4. Scale bbox back to original coords
+    """
     iw, ih = img_pil.size
     cv_img, sx, sy, sv_w, sv_h = _resize_for_detection(img_pil)
     sw, sh = sv_w, sv_h
@@ -559,7 +566,9 @@ def engine_smart_crop(img, tw, th, category="General", **_):
 
 
 def engine_fashion_consistent(img, tw, th, category="General", **_):
-    """Fashion Consistent Engine v12.0 - Siar Digital"""
+    """
+    Fashion Consistent Engine v12.0 - Siar Digital
+    """
     HEAD_TOP_PCT = 0.07
     FEET_BOT_PCT = 0.02
     iw, ih = img.size
@@ -744,7 +753,7 @@ def engine_stretch(img, tw, th, **_):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  POSE AI (SOTA) ENGINE — YOLOv8-Pose  (FIX 6 / 7 / 8 / 9 / 10)
+#  POSE AI (SOTA) ENGINE — YOLOv8-Pose / YOLOv11-Pose
 # ─────────────────────────────────────────────────────────────────────────────
 
 _POSE_KP = {
@@ -755,8 +764,8 @@ _POSE_KP = {
 }
 _POSE_KP_CONF    = 0.30
 _POSE_DARK_THR   = 80
-_POSE_HEAD_SPACE = 0.10   # 10% above head
-_POSE_FOOT_SPACE = 0.05   # 5% below feet
+_POSE_HEAD_SPACE = 0.10   # 10% above head  (tuned: desired outputs show ~8-10%)
+_POSE_FOOT_SPACE = 0.05   # 5% below feet   (tuned: desired outputs show ~3-5%)
 _POSE_MODEL_NAME = "yolov8m-pose.pt"
 
 def _pose_get_model():
@@ -855,21 +864,25 @@ def _bbox_mean_brightness(img_bgr, bx1, by1, bx2, by2):
         return 0.0
     roi = img_bgr[y1:y2, x1:x2]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    return float(hsv[:, :, 2].mean())
+    return float(hsv[:, :, 2].mean())   # V channel
 
 
 def _pose_run_yolo(model, img_bgr, conf, img_h, img_w):
     """
-    FIX 10 — Shadow rejection.
-    Score each detected person by area × (brightness/255)².
-    Real models with coloured clothing beat large dark shadows.
-    Single dim candidates (brightness < 45) are rejected outright.
+    Run pose estimation and return the REAL model's pose, not a shadow.
+
+    Shadow rejection: shadows have very low brightness.  When multiple
+    person detections exist, score each candidate by
+        score = area * brightness_weight
+    so a bright, colourful real model beats a larger but dark shadow.
+    Single detection: still verify minimum brightness (>= _POSE_MIN_BRIGHTNESS);
+    if it's too dark we discard and let Tier-2/3 handle it.
     """
-    _POSE_MIN_BRIGHTNESS = 45
-    _BRIGHTNESS_WEIGHT   = 2.0
+    _POSE_MIN_BRIGHTNESS = 45   # detections darker than this are likely shadows
+    _BRIGHTNESS_WEIGHT   = 2.0  # how much to prefer brightness over area
 
     results = model(img_bgr, conf=conf, verbose=False, task="pose")
-    candidates = []
+    candidates = []   # list of (score, brightness, pose)
 
     for r in results:
         if r.keypoints is None:
@@ -880,7 +893,7 @@ def _pose_run_yolo(model, img_bgr, conf, img_h, img_w):
             kps  = kps_all[idx]
             bbox = None
             area = float(img_h * img_w)
-            brightness = 128.0
+            brightness = 128.0   # default if no bbox
             if boxes is not None and idx < len(boxes):
                 bx1, by1, bx2, by2 = boxes[idx]
                 area       = (bx2 - bx1) * (by2 - by1)
@@ -889,7 +902,9 @@ def _pose_run_yolo(model, img_bgr, conf, img_h, img_w):
             pose = _pose_extract(kps, img_h, img_w, bbox)
             if pose is None:
                 continue
+            # Normalise area to [0,1] relative to full image
             norm_area = area / max(img_h * img_w, 1)
+            # Combined score: area matters but brightness breaks ties decisively
             score = norm_area * (brightness / 255.0) ** _BRIGHTNESS_WEIGHT
             candidates.append((score, brightness, pose))
             log.debug(f"Pose candidate: area={area:.0f} bright={brightness:.1f} score={score:.4f}")
@@ -897,9 +912,11 @@ def _pose_run_yolo(model, img_bgr, conf, img_h, img_w):
     if not candidates:
         return None
 
+    # Pick highest score (real model beats shadow)
     candidates.sort(key=lambda x: x[0], reverse=True)
     best_score, best_brightness, best_pose = candidates[0]
 
+    # Single dim candidate — likely a shadow, reject
     if best_brightness < _POSE_MIN_BRIGHTNESS:
         log.info(f"Pose AI: rejected dim detection (brightness={best_brightness:.1f} "
                  f"< {_POSE_MIN_BRIGHTNESS}) — likely shadow")
@@ -912,7 +929,15 @@ def _pose_run_yolo(model, img_bgr, conf, img_h, img_w):
 
 def _pose_compute_crop(pose, img_h, img_w, tw, th):
     """
-    FIX 6: skip min_crop_w expansion when it would exceed img_h.
+    Compute (x1,y1,x2,y2) crop in original image coords.
+
+    FIX 6: min_crop_w expansion guard.
+    When body_w is large (wide poses, landscape images, multiple people),
+    expanding to min_crop_w = body_w * 1.20 can make crop_h >> img_h.
+    The resulting crop_top (very negative) clamps to 0, which pushes the
+    head far below the 12% headspace target.
+    Fix: only apply the expansion when the resulting crop_h fits within img_h.
+    The body_w guarantee is best-effort; headspace accuracy takes priority.
     """
     target_aspect = tw / th
     person_h = max(pose["feet_y"] - pose["head_top_y"], 1.0)
@@ -931,12 +956,15 @@ def _pose_compute_crop(pose, img_h, img_w, tw, th):
     crop_left  = pose["center_x"] - crop_w / 2.0
     crop_right = crop_left + crop_w
 
+    # ── FIX 6: Only expand for body_w when the expanded crop fits in img_h.
+    #    Original code always expanded, causing crop_h >> img_h for wide shots,
+    #    which broke the headspace guarantee after boundary clamping.
     body_w     = pose["body_right"] - pose["body_left"]
     min_crop_w = body_w * 1.20
     if crop_w < min_crop_w:
         new_crop_w = min_crop_w
         new_crop_h = new_crop_w / target_aspect
-        if new_crop_h <= img_h:
+        if new_crop_h <= img_h:  # only expand if it fits
             crop_w      = new_crop_w
             crop_h      = new_crop_h
             crop_top    = adj_head_y - _POSE_HEAD_SPACE * crop_h
@@ -954,7 +982,14 @@ def _pose_compute_crop(pose, img_h, img_w, tw, th):
             int(round(crop_right)), int(round(crop_bottom)))
 
 def _pose_from_yolo_bbox(img_bgr, img_h, img_w):
-    """FIX 8 – Tier-2: YOLOv8n person bbox fallback."""
+    """
+    FIX 8 – Tier-2 fallback: use YOLOv8n person BBOX (already loaded for
+    Smart Crop) to build a pose-compatible dict when the skeleton model
+    returns nothing (back-facing, side poses, heavy occlusion).
+    bbox top  → head_top_y
+    bbox bottom → feet_y
+    bbox center_x → center_x
+    """
     det_model = _get_yolo()
     if det_model is None:
         return None
@@ -968,12 +1003,13 @@ def _pose_from_yolo_bbox(img_bgr, img_h, img_w):
                 continue
             for box, cls in zip(r.boxes.xyxy.cpu().numpy(),
                                 r.boxes.cls.cpu().numpy()):
-                if int(cls) != 0:
+                if int(cls) != 0:   # 0 = person in COCO
                     continue
                 x1, y1, x2, y2 = box
                 area = (x2 - x1) * (y2 - y1)
                 if area > best_area:
                     best_area = area
+                    # Scale coords back to original image space
                     best_box = (x1 / sx, y1 / sy, x2 / sx, y2 / sy)
         if best_box is None:
             return None
@@ -985,7 +1021,7 @@ def _pose_from_yolo_bbox(img_bgr, img_h, img_w):
             "center_x":    float(cx),
             "body_left":   float(bx1),
             "body_right":  float(bx2),
-            "offset_frac": 0.02,
+            "offset_frac": 0.02,    # bbox already includes head — minimal extra offset
         }
     except Exception as e:
         log.debug(f"Pose Tier-2 bbox fallback error: {e}")
@@ -993,7 +1029,12 @@ def _pose_from_yolo_bbox(img_bgr, img_h, img_w):
 
 
 def _pose_from_face_body(img_pil, img_h, img_w):
-    """FIX 8 – Tier-3: Haar face + body ratio estimate."""
+    """
+    FIX 8 – Tier-3 fallback: Haar-cascade face detection → estimate full
+    body extent.  Used when both skeleton and bbox detection fail.
+    head_top  = face_top - 15% of face_h  (hair above hairline)
+    feet_y    = head_top + person_h  where person_h ≈ 7.5 × face_h
+    """
     if not HAS_OPENCV:
         return None
     try:
@@ -1007,6 +1048,7 @@ def _pose_from_face_body(img_pil, img_h, img_w):
         faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
         if not len(faces):
             return None
+        # Largest face
         fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
         fx  = fx  * sx;  fy  = fy  * sy
         fw  = fw  * sx;  fh  = fh  * sy
@@ -1029,13 +1071,15 @@ def _pose_from_face_body(img_pil, img_h, img_w):
 
 def engine_pose_ai(img, tw, th, **_):
     """
-    Pose AI (SOTA) — 4-tier detection with shadow rejection.
+    Pose AI (SOTA) — 3-tier detection with consistent full-body framing.
 
-    Tier 1 — YOLOv8m-pose skeleton  + FIX 10 shadow rejection
-    Tier 2 — YOLOv8n person bbox    (FIX 8)
-    Tier 3 — Haar face + body est.  (FIX 8)
-    Tier 4 — center crop            (last resort)
-    FIX 7/9 — AR correction after boundary clamping (no stretch, no foot cut)
+    FIX 8: 3-tier fallback so back-facing / side / occluded poses are
+    handled correctly instead of falling back to a dumb center crop.
+
+    Tier 1 — YOLOv8m-pose skeleton  (best: head_top + feet_y from keypoints)
+    Tier 2 — YOLOv8n person BBOX    (good: top/bottom of detected person box)
+    Tier 3 — Haar face + body est.  (ok:  face position × body ratio)
+    Tier 4 — center crop            (last resort only — logs a warning)
     """
     if not HAS_YOLO:
         log.warning("Pose AI: ultralytics not installed — pip install ultralytics")
@@ -1051,7 +1095,7 @@ def engine_pose_ai(img, tw, th, **_):
 
     img_for_det = _pose_normalize_dark(img_bgr)
 
-    # Tier 1: skeleton detection (with shadow rejection)
+    # ── Tier 1: skeleton detection ───────────────────────────────────────
     pose = _pose_run_yolo(model, img_for_det, 0.35, img_h, img_w)
 
     if pose is None:
@@ -1062,17 +1106,17 @@ def engine_pose_ai(img, tw, th, **_):
         pose = _pose_run_yolo(model, cv2.LUT(img_for_det, gamma_table),
                               0.15, img_h, img_w)
 
-    # Tier 2: YOLOv8n person bbox
+    # ── Tier 2: YOLOv8n person bbox fallback ─────────────────────────────
     if pose is None:
         log.info("Pose AI Tier-2: skeleton missed — trying YOLOv8n person bbox")
         pose = _pose_from_yolo_bbox(img_bgr, img_h, img_w)
 
-    # Tier 3: Haar face + body estimate
+    # ── Tier 3: Haar face + body-ratio estimate ───────────────────────────
     if pose is None:
         log.info("Pose AI Tier-3: bbox missed — trying Haar face+body estimate")
         pose = _pose_from_face_body(img, img_h, img_w)
 
-    # Tier 4: centre crop (last resort)
+    # ── Tier 4: centre crop (last resort) ────────────────────────────────
     if pose is None:
         log.warning("Pose AI Tier-4: all detection failed — centre crop fallback")
         return ImageOps.fit(img, (tw, th), Image.Resampling.LANCZOS,
@@ -1084,33 +1128,47 @@ def engine_pose_ai(img, tw, th, **_):
     cx2 = min(img_w, x2);  cy2 = min(img_h, y2)
     cx2 = max(cx2, cx1+1); cy2 = max(cy2, cy1+1)
 
-    # FIX 7 + FIX 9: Re-enforce target AR after boundary clamping
-    # AR > target → trim width symmetrically (keeps head/feet)
-    # AR < target → expand width on detected center (keeps feet); trim height only if must
+    # ── FIX 7 + FIX 9: Re-enforce target AR after boundary clamping.
+    #
+    #  FIX 7 (original): handled the "too wide" case correctly — trim width
+    #  symmetrically.  BUT its "too tall" branch trimmed height from the
+    #  bottom, which cut off the model's feet on narrow/side-profile images.
+    #
+    #  FIX 9: corrects the "too tall" strategy:
+    #    • FIRST try to expand width (adds background, keeps full body) ✓
+    #    • Only fall back to trimming height if the image isn't wide enough
+    #      (e.g. landscape source or model at the very edge).
+    #
+    #  Summary of strategy:
+    #    AR > target (too wide)  → trim width symmetrically, centred on subject
+    #    AR < target (too tall)  → expand width; if can't, trim height from bottom
     target_ar = tw / th
     cw = cx2 - cx1
     ch = cy2 - cy1
     actual_ar = cw / max(ch, 1)
-    if abs(actual_ar - target_ar) > 0.005:
+    if abs(actual_ar - target_ar) > 0.005:          # more than 0.5% off
         if actual_ar > target_ar:                    # too wide → trim width
             new_w  = int(ch * target_ar)
             cx_mid = (cx1 + cx2) // 2
             cx1    = max(0,     cx_mid - new_w // 2)
             cx2    = min(img_w, cx1    + new_w)
-            if cx2 - cx1 < new_w:
+            if cx2 - cx1 < new_w:                   # hit right edge → re-anchor left
                 cx1 = max(0, cx2 - new_w)
-        else:                                        # too tall → expand width first (FIX 9)
+        else:                                        # too tall → expand width first
             new_w  = int(ch * target_ar)
-            if new_w <= img_w:
+            if new_w <= img_w:                       # width fits → expand (FIX 9)
+                # Centre on the DETECTED model centre_x, not the old narrow
+                # crop midpoint — prevents the model drifting left/right after
+                # the bbox was narrower than the full-body width.
                 det_cx = int(pose.get("center_x", (cx1 + cx2) / 2))
                 cx1    = max(0,     det_cx - new_w // 2)
                 cx2    = min(img_w, cx1    + new_w)
-                if cx2 - cx1 < new_w:
+                if cx2 - cx1 < new_w:               # hit right edge → re-anchor
                     cx1 = max(0, cx2 - new_w)
             else:                                    # image too narrow → trim height
                 new_h = int(img_w / target_ar)
                 cy2   = min(img_h, cy1 + new_h)
-                if cy2 - cy1 < new_h:
+                if cy2 - cy1 < new_h:               # hit bottom → pull top down
                     cy1 = max(0, cy2 - new_h)
                 cx1 = 0; cx2 = img_w
         cx2 = max(cx2, cx1 + 1)
@@ -1172,7 +1230,7 @@ def save_with_quality_guard(img, out_path, fmt, initial_quality, lossless):
         f.write(buf.read())
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  File Scanner
+#  File Scanner — skips macOS hidden files
 # ─────────────────────────────────────────────────────────────────────────────
 def scan_image_files(input_path):
     input_path = os.path.normpath(os.path.abspath(input_path))
