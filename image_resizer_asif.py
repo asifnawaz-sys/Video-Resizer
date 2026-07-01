@@ -115,13 +115,16 @@ try:
     from ultralytics import YOLO
     HAS_YOLO = True
     _yolo_model = None
+    _yolo_lock  = threading.Lock()
 except ImportError:
     HAS_YOLO = False
     YOLO = None
     _yolo_model = None
+    _yolo_lock  = threading.Lock()
 
 # Pose model cache (separate from detection model)
 _pose_model_cache: dict = {}
+_pose_lock = threading.Lock()
 
 try:
     import mediapipe as mp
@@ -227,7 +230,7 @@ FONTS = {
 }
 
 SUPPORTED_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.tiff', '.tif',
-                  '.bmp', '.gif', '.ico', '.ppm')
+                  '.bmp', '.ppm')
 
 QUALITY_LIMIT_KB = 3072  # 3 MB
 
@@ -285,13 +288,15 @@ _DETECT_H = 1200
 def _get_yolo():
     global _yolo_model
     if HAS_YOLO and _yolo_model is None:
-        try:
-            bundled = _resource('yolov8n.pt')
-            model_path = bundled if os.path.exists(bundled) else 'yolov8n.pt'
-            _yolo_model = YOLO(model_path)
-            log.info(f"YOLOv8 loaded from: {model_path}")
-        except Exception as e:
-            log.warning(f"YOLOv8 load failed: {e}")
+        with _yolo_lock:
+            if _yolo_model is None:
+                try:
+                    bundled = _resource('yolov8n.pt')
+                    model_path = bundled if os.path.exists(bundled) else 'yolov8n.pt'
+                    _yolo_model = YOLO(model_path)
+                    log.info(f"YOLOv8 loaded from: {model_path}")
+                except Exception as e:
+                    log.warning(f"YOLOv8 load failed: {e}")
     return _yolo_model
 
 def _resize_for_detection(img_pil):
@@ -332,19 +337,6 @@ def _detect_face_cv(gray_img, sw, sh):
         return None
     best = max(all_candidates, key=lambda c: c[4])
     return best[0], best[1], best[2], best[3]
-
-def _estimate_body_from_face(face, sv_w, sv_h):
-    fx, fy, fw, fh = face
-    face_cx = fx + fw // 2
-    head_top_s    = max(0, fy - int(fh * 0.90))
-    feet_bottom_s = min(sv_h, fy + int(fh * 7.5))
-    half_bw       = max(int(fw * 1.8), int(sv_w * 0.12))
-    return {
-        "head_top_s":    head_top_s,
-        "feet_bottom_s": feet_bottom_s,
-        "body_left_s":   max(0, face_cx - half_bw),
-        "body_right_s":  min(sv_w, face_cx + half_bw),
-    }
 
 def _detect_person_bbox_cv(img_pil, category):
     """
@@ -575,6 +567,9 @@ def engine_fashion_consistent(img, tw, th, category="General", **_):
     """
     Fashion Consistent Engine v12.0 - Siar Digital
     """
+    if not HAS_OPENCV:
+        log.warning("Fashion Consistent: OpenCV not installed — falling back to Smart Crop")
+        return engine_smart_crop(img, tw, th, category=category)
     HEAD_TOP_PCT = 0.07
     FEET_BOT_PCT = 0.02
     iw, ih = img.size
@@ -775,18 +770,19 @@ _POSE_FOOT_SPACE = 0.05   # 5% below feet   (tuned: desired outputs show ~3-5%)
 _POSE_MODEL_NAME = "yolov8m-pose.pt"
 
 def _pose_get_model():
-    global _pose_model_cache
     if _POSE_MODEL_NAME not in _pose_model_cache:
-        if not HAS_YOLO:
-            return None
-        try:
-            bundled = _resource(_POSE_MODEL_NAME)
-            model_path = bundled if os.path.exists(bundled) else _POSE_MODEL_NAME
-            _pose_model_cache[_POSE_MODEL_NAME] = YOLO(model_path)
-            log.info(f"Pose model loaded: {model_path}")
-        except Exception as e:
-            log.warning(f"Pose model load failed: {e}")
-            return None
+        with _pose_lock:
+            if _POSE_MODEL_NAME not in _pose_model_cache:
+                if not HAS_YOLO:
+                    return None
+                try:
+                    bundled = _resource(_POSE_MODEL_NAME)
+                    model_path = bundled if os.path.exists(bundled) else _POSE_MODEL_NAME
+                    _pose_model_cache[_POSE_MODEL_NAME] = YOLO(model_path)
+                    log.info(f"Pose model loaded: {model_path}")
+                except Exception as e:
+                    log.warning(f"Pose model load failed: {e}")
+                    return None
     return _pose_model_cache.get(_POSE_MODEL_NAME)
 
 def _pose_normalize_dark(img_bgr):
@@ -1093,6 +1089,9 @@ def engine_pose_ai(img, tw, th, **_):
     if not HAS_YOLO:
         log.warning("Pose AI: ultralytics not installed — pip install ultralytics")
         return engine_fill_crop(img, tw, th)
+    if not HAS_OPENCV:
+        log.warning("Pose AI: OpenCV not installed — falling back to Fill Crop")
+        return engine_fill_crop(img, tw, th)
 
     model = _pose_get_model()
     if model is None:
@@ -1228,7 +1227,7 @@ def save_with_quality_guard(img, out_path, fmt, initial_quality, lossless):
         else:
             img.save(buf, format=ext.upper())
         size_kb = buf.tell() / 1024
-        if size_kb <= QUALITY_LIMIT_KB or ext in ("png", "bmp", "tiff"):
+        if size_kb <= QUALITY_LIMIT_KB or ext == "bmp":
             buf.seek(0)
             with open(out_path, "wb") as f:
                 f.write(buf.read())
@@ -1313,8 +1312,6 @@ def process_one(abs_path, rel_path, out_dir, tw, th, mode, fmt,
         engine_fn = MODE_MAP.get(mode, engine_mirror_bg)
         if engine_fn in (engine_smart_crop, engine_fashion_consistent):
             result = engine_fn(img, tw, th, category=category)
-        elif engine_fn is engine_pose_ai:
-            result = engine_fn(img, tw, th)
         else:
             result = engine_fn(img, tw, th)
 
