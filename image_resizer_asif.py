@@ -52,6 +52,12 @@ BUG FIXES v4.5.2:
             area × (brightness/255)², so a bright coloured model always beats
             a larger but dark shadow. Detections below brightness=45 are
             rejected outright and passed to Tier-2/3 fallback.
+  - FIX 11: _pose_get_model() was calling YOLO(_POSE_MODEL_NAME) without
+            _resource() — in the macOS PyInstaller bundle the model lives in
+            sys._MEIPASS, not the CWD, so the load always failed silently and
+            every image fell back to engine_fill_crop (center crop), producing
+            wildly incorrect headspace. Fix: use _resource() exactly as
+            _get_yolo() does for yolov8n.pt.
 """
 
 import os
@@ -774,8 +780,10 @@ def _pose_get_model():
         if not HAS_YOLO:
             return None
         try:
-            _pose_model_cache[_POSE_MODEL_NAME] = YOLO(_POSE_MODEL_NAME)
-            log.info(f"Pose model loaded: {_POSE_MODEL_NAME}")
+            bundled = _resource(_POSE_MODEL_NAME)
+            model_path = bundled if os.path.exists(bundled) else _POSE_MODEL_NAME
+            _pose_model_cache[_POSE_MODEL_NAME] = YOLO(model_path)
+            log.info(f"Pose model loaded: {model_path}")
         except Exception as e:
             log.warning(f"Pose model load failed: {e}")
             return None
@@ -994,7 +1002,8 @@ def _pose_from_yolo_bbox(img_bgr, img_h, img_w):
     if det_model is None:
         return None
     try:
-        det_img, sx, sy = _resize_for_detection(img_bgr)
+        img_pil_t2 = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        det_img, sx, sy, _, _ = _resize_for_detection(img_pil_t2)
         results = det_model(det_img, verbose=False)
         best_box  = None
         best_area = 0
